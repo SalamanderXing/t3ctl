@@ -42,6 +42,7 @@ DB=${T3CTL_DB:-/data/home/dev/.t3/userdata/state.sqlite}
 MAX_RUNNING=${T3CTL_MAX_RUNNING:-3}
 TAG=${T3CTL_TAG:-[agent]}
 NOTIFY_CMD=${T3CTL_NOTIFY_BIN:-${T3CTL_NOTIFY_CMD:-t3-notify}}   # the callback command sessions run
+NOTIFY_BIN=$NOTIFY_CMD   # same thing; selftest and the approver use this name
 ALLOW_FULL=${T3CTL_ALLOW_FULL_ACCESS:-1}
 DENY_ORIGINS=${T3CTL_DENY_ORIGINS:-}
 TEXT_CAP=${T3CTL_TEXT_CAP:-3000}   # chars of message text shown per message
