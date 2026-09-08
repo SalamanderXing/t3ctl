@@ -1,0 +1,8 @@
+[Unit]
+Description=Rotate the t3 bearer token used by t3ctl
+After=t3.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/t3-token-renew
+TimeoutStartSec=5min

@@ -1,0 +1,19 @@
+# Auto-accepts the one command an agent-created t3 thread must run to call
+# the agent back (t3-notify, or the name in T3CTL_NOTIFY_BIN), which
+# approval-required mode would otherwise hold for a human — making the
+# callback contract useless for unattended threads. Only that exact command,
+# only in threads titled with T3CTL_TAG; see `t3ctl approve-callbacks` for
+# the match rule. Runs as root for the token file.
+[Unit]
+Description=Auto-approve agent callback commands in t3ctl-created threads
+After=t3.service
+Wants=t3.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/t3ctl approve-callbacks --loop 15
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

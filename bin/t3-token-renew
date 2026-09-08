@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# t3-token-renew — mint/rotate the t3 bearer token that t3ctl uses.
+#
+# Why a rotation unit: t3 sessions ALWAYS expire — there is no non-expiring
+# token — and a 401 from t3ctl would silently strand the agent's t3 control.
+# Weekly rotation of a 30d-TTL token means several missed runs are survivable.
+#
+# The token must be minted as the user t3 runs as (its auth state lives in
+# that user's ~/.t3/userdata) but is stored root-only, because the agent's
+# shell runs as root and nothing else on the box should read it.
+# `t3 auth session issue` has no --scopes flag, so the token carries every
+# scope incl. access:write — accepted knowingly (docs/t3-hermes-control.md
+# §4); the file mode is the only narrowing we get.
+#
+# Failure alerting: `hermes send` to the owner, because the failure mode is
+# "t3 control quietly dies in up to 30 days".
+set -uo pipefail
+
+[ -r /etc/t3ctl.conf ] && . /etc/t3ctl.conf
+
+TOKEN_FILE=${T3CTL_TOKEN_FILE:-/etc/t3ctl/token}
+SESSION_FILE=${T3CTL_SESSION_FILE:-/etc/t3ctl/session-id}
+T3_USER=${T3CTL_T3_USER:-dev}
+T3_WORKDIR=${T3CTL_T3_WORKDIR:-/data/workspace}
+T3_VERSION_FILE=${T3CTL_T3_VERSION_FILE:-/etc/default/t3}
+TTL=${T3CTL_TOKEN_TTL:-30d}
+LABEL=${T3CTL_TOKEN_LABEL:-t3ctl}
+BASE=${T3CTL_URL:-http://127.0.0.1:3773}
+HERMES=${T3CTL_HERMES:-/opt/hermes-venv/bin/hermes}
+HERMES_HOME=${T3CTL_HERMES_HOME:-/data/repo/home}
+TARGET=${T3CTL_ALERT_TARGET:-}
+FALLBACK=${T3CTL_ALERT_FALLBACK:-}
+
+fail() {
+  echo "t3-token-renew: $*" >&2
+  body="⚠️ t3 token renewal failed on $(hostname): $*
+t3ctl will start 401ing when the current token expires. Fix: systemctl start t3-token-renew (see journalctl -u t3-token-renew)."
+  if [ -n "$TARGET" ] && [ -x "$HERMES" ]; then
+    HERMES_HOME="$HERMES_HOME" "$HERMES" send --to "$TARGET" -q "$body" \
+      || { [ -n "$FALLBACK" ] && HERMES_HOME="$HERMES_HOME" "$HERMES" send --to "$FALLBACK" -q "$body"; } || true
+  fi
+  exit 1
+}
+
+VER=$(sed -n 's/^T3_VERSION=//p' "$T3_VERSION_FILE")
+[ -n "$VER" ] || fail "no T3_VERSION in $T3_VERSION_FILE"
+
+as_t3_user() { runuser -u "$T3_USER" -- bash -lc "cd '$T3_WORKDIR' && npx -y t3@$VER $*"; }
+
+out=$(as_t3_user "auth session issue --ttl $TTL --label $LABEL --json" 2>&1) \
+  || fail "session issue errored: $(tail -c 300 <<<"$out")"
+tok=$(jq -r '.token // empty' <<<"$out")
+sid=$(jq -r '.sessionId // empty' <<<"$out")
+[ -n "$tok" ] && [ -n "$sid" ] || fail "could not parse token/sessionId from issue output"
+
+# Probe the new token before swapping it in — never replace a working token
+# with a broken one.
+curl -sSf -m 30 -H "Authorization: Bearer $tok" \
+  "$BASE/api/orchestration/snapshot" -o /dev/null \
+  || fail "new token failed its snapshot probe (t3 down, or API changed after a T3_VERSION bump)"
+
+old_sid=$(cat "$SESSION_FILE" 2>/dev/null || true)
+umask 077
+mkdir -p "$(dirname "$TOKEN_FILE")" "$(dirname "$SESSION_FILE")"
+printf '%s\n' "$tok" > "$TOKEN_FILE.tmp" && mv "$TOKEN_FILE.tmp" "$TOKEN_FILE"
+printf '%s\n' "$sid" > "$SESSION_FILE.tmp" && mv "$SESSION_FILE.tmp" "$SESSION_FILE"
+
+# Revoke the predecessor only after the new token is installed. Best-effort:
+# an unrevoked old session just expires on its own TTL.
+if [ -n "$old_sid" ] && [ "$old_sid" != "$sid" ]; then
+  as_t3_user "auth session revoke $old_sid" >/dev/null 2>&1 \
+    || echo "t3-token-renew: warning: could not revoke old session $old_sid (it will expire by TTL)" >&2
+fi
+
+echo "t3-token-renew: rotated (session $sid, ttl $TTL)"

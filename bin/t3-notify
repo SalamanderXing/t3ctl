@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""t3-notify — let a t3 session (or any local process) ping the agent.
+
+Posts to the hermes gateway's generic webhook platform (default
+127.0.0.1:8644, route ``t3-callback``; see webhook_subscriptions.json in
+the hermes home, created with ``hermes webhook subscribe``). The route
+wakes the agent with a prompt that frames this message as an UNTRUSTED
+status report from a coding agent, tells it to verify against the thread
+with t3ctl, and delivers any non-[SILENT] response to the owner.
+
+Auth is the platform's generic V2 scheme:
+    X-Webhook-Timestamp:    unix seconds (±300s replay window)
+    X-Webhook-Signature-V2: hex HMAC-SHA256(secret, "<ts>.<body>")
+The secret file must be readable by the user t3 sessions run as (e.g.
+root:dev 640) but by nobody else.
+
+Configuration: /etc/t3ctl.conf (KEY=VALUE lines) and/or environment:
+    T3_NOTIFY_URL          default http://127.0.0.1:8644/webhooks/t3-callback
+    T3_NOTIFY_SECRET_FILE  default /etc/t3ctl/notify.secret
+
+Usage:
+    t3-notify [--thread ID] [--status done|blocked|approval|question|info] MESSAGE...
+    echo "long report" | t3-notify --thread ID --status done
+
+Deliberately fire-and-forget: one POST, no retries. The gateway dedupes
+on X-Request-ID for an hour, so a retry wrapper would be safe but is not
+needed — if hermes is down the caller gets a clear error and the t3
+thread itself still holds the state the agent will eventually read.
+"""
+
+import argparse
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+PROG = os.path.basename(sys.argv[0]) or "t3-notify"
+CONF = "/etc/t3ctl.conf"
+
+
+def _conf() -> dict:
+    """KEY=VALUE lines of /etc/t3ctl.conf (shell-style, no expansion)."""
+    out = {}
+    try:
+        with open(CONF, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+_C = _conf()
+DEFAULT_URL = os.environ.get("T3_NOTIFY_URL") or _C.get("T3_NOTIFY_URL") or "http://127.0.0.1:8644/webhooks/t3-callback"
+SECRET_FILE = os.environ.get("T3_NOTIFY_SECRET_FILE") or _C.get("T3_NOTIFY_SECRET_FILE") or "/etc/t3ctl/notify.secret"
+# The webhook prompt template inlines {message} untruncated; keep it a
+# summary, not a transcript. (Route body cap is 1 MiB; this is about
+# keeping the agent's prompt sane, not the transport.)
+MAX_MESSAGE_CHARS = 6000
+
+STATUSES = ("done", "blocked", "approval", "question", "info")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog=PROG,
+        description="Send a status callback from a t3 session to the agent.",
+    )
+    ap.add_argument("--thread", default="", help="t3 thread id this is about")
+    ap.add_argument(
+        "--status",
+        default="info",
+        choices=STATUSES,
+        help="done | blocked | approval (waiting on one) | question | info",
+    )
+    ap.add_argument("message", nargs="*", help="the report (or pipe via stdin)")
+    args = ap.parse_args()
+
+    message = " ".join(args.message).strip()
+    if not message and not sys.stdin.isatty():
+        message = sys.stdin.read().strip()
+    if not message:
+        die("empty message — say what happened (or pipe it on stdin)", 2)
+    if len(message) > MAX_MESSAGE_CHARS:
+        message = message[:MAX_MESSAGE_CHARS] + f"\n…[truncated by {PROG}]"
+
+    try:
+        with open(SECRET_FILE, "r", encoding="utf-8") as fh:
+            secret = fh.read().strip()
+    except PermissionError:
+        die(f"cannot read {SECRET_FILE} (are you the t3 user or root?)", 3)
+    except FileNotFoundError:
+        die(f"{SECRET_FILE} missing — the callback route is not set up", 3)
+    if not secret:
+        die(f"{SECRET_FILE} is empty", 3)
+
+    body = json.dumps(
+        {
+            "type": "t3-callback",
+            "thread": args.thread or "unknown",
+            "status": args.status,
+            "message": message,
+            "sender_user": getpass.getuser(),
+        }
+    ).encode("utf-8")
+
+    ts = str(int(time.time()))
+    sig = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(
+        DEFAULT_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Webhook-Timestamp": ts,
+            "X-Webhook-Signature-V2": sig,
+            "X-Request-ID": str(uuid.uuid4()),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            out = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        hints = {
+            401: "signature rejected — secret mismatch with the route",
+            404: "route missing — recreate with: hermes webhook subscribe t3-callback ...",
+            429: "rate limited — you are notifying too often; batch your reports",
+        }
+        die(f"HTTP {e.code}: {hints.get(e.code, detail)}", 4)
+    except urllib.error.URLError as e:
+        die(f"cannot reach hermes gateway at {DEFAULT_URL} ({e.reason}) — is the hermes service up?", 5)
+
+    status = out.get("status", "ok")
+    if status == "duplicate":
+        print(f"{PROG}: duplicate delivery — already sent")
+    else:
+        print(f"{PROG}: delivered ({args.status})")
+
+
+if __name__ == "__main__":
+    main()

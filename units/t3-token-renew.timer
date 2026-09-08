@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly t3 token rotation (token TTL is 30d, so missed runs are survivable)
+
+[Timer]
+OnCalendar=Mon *-*-* 05:30:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

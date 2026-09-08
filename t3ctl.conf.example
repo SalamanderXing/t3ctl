@@ -1,0 +1,37 @@
+# /etc/t3ctl.conf — the one box-specific file for the t3ctl tooling.
+# Shell KEY=VALUE lines; sourced by t3ctl, t3-token-renew and the
+# t3-callback-approver unit, parsed by t3-notify. install.sh copies this
+# file into place once and never overwrites it.
+
+# Where t3 serves and who runs it (token minting happens as this user, in
+# this directory, with the version pinned in this file).
+T3CTL_URL=http://127.0.0.1:3773
+T3CTL_T3_USER=dev
+T3CTL_T3_WORKDIR=/data/workspace
+T3CTL_T3_VERSION_FILE=/etc/default/t3
+T3CTL_DB=/data/home/dev/.t3/userdata/state.sqlite   # for `t3ctl search` (read-only)
+
+# Bearer token written by t3-token-renew (root-only).
+T3CTL_TOKEN_FILE=/etc/t3ctl/token
+T3CTL_SESSION_FILE=/etc/t3ctl/session-id
+T3CTL_TOKEN_TTL=30d
+T3CTL_TOKEN_LABEL=t3ctl
+
+# Threads the agent creates are titled with this prefix; stop/interrupt/rm
+# refuse other threads without --force, and the callback approver only acts
+# inside these threads.
+T3CTL_TAG="[agent]"
+T3CTL_MAX_RUNNING=3
+
+# How a session calls the agent back. The binary name appears in the prompt
+# footer and in the approver's match rule; a symlink with this name is
+# created if it differs from t3-notify.
+T3CTL_NOTIFY_BIN=t3-notify
+T3_NOTIFY_URL=http://127.0.0.1:8644/webhooks/t3-callback
+T3_NOTIFY_SECRET_FILE=/etc/t3ctl/notify.secret
+
+# Alerts when token rotation fails (hermes send targets; empty = no alert).
+T3CTL_HERMES=/opt/hermes-venv/bin/hermes
+T3CTL_HERMES_HOME=/data/repo/home
+T3CTL_ALERT_TARGET=
+T3CTL_ALERT_FALLBACK=
