@@ -8,8 +8,8 @@
 #   skills/      -> /usr/local/share/t3ctl/skills   (add to hermes config:
 #                   skills.external_dirs: [/usr/local/share/t3ctl/skills])
 #   t3ctl.conf.example -> /etc/t3ctl.conf   (only if missing; edit it)
-#   VERSION      -> /var/lib/t3ctl/version, plus a sha256 manifest of every
-#                   installed path for the host's drift check.
+#   version      -> /var/lib/t3ctl/version (from VERSION, .pin, or git describe),
+#                   plus a sha256 manifest of every installed path for drift check.
 #
 # It does not mint a token (systemctl start t3-token-renew does, once
 # /etc/t3ctl.conf is right) and does not create the hermes webhook route or
@@ -62,7 +62,11 @@ else
 fi
 
 mkdir -p "$STATE"
-cp "$SRC/VERSION" "$STATE/version"
+# Version, most-specific first: a committed VERSION file, else the .pin that
+# devbox-v2's deploy.sh drops next to this script, else git, else unknown.
+VERSION=$(cat "$SRC/VERSION" 2>/dev/null || cat "$SRC/.pin" 2>/dev/null \
+  || git -C "$SRC" describe --tags --always 2>/dev/null || echo unknown)
+printf '%s\n' "$VERSION" > "$STATE/version"
 : > "$STATE/manifest.sha256"
 for p in "${manifest[@]}"; do [ -f "$p" ] && sha256sum "$p" >> "$STATE/manifest.sha256"; done
-echo "t3ctl $(cat "$STATE/version") installed (${#changed[@]} path(s) changed, manifest $(wc -l < "$STATE/manifest.sha256") files)"
+echo "t3ctl $VERSION installed (${#changed[@]} path(s) changed, manifest $(wc -l < "$STATE/manifest.sha256") files)"
