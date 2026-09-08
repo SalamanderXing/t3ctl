@@ -805,10 +805,27 @@ cmd_selftest() {
   tid=$(jq -r .threadId <<<"$w")
   echo "selftest: thread $tid" >&2
   SNAP=""; w=$(cmd_watch "$tid" --timeout 120)
-  reason=$(jq -r .reason <<<"$w"); ans=$(jq -r '.lastAssistant // ""' <<<"$w")
-  if [ "$reason" = settled ] && [[ $ans == *PONG* ]]; then pong_s=$((SECONDS - t0)); else fail=1; echo "selftest: PONG leg failed: $w" >&2; fi
+  reason=$(jq -r .reason <<<"$w")
+  # Some models run the callback right after PONG (the footer asks for it on
+  # completion). That pending approval is the approver's to accept — keep
+  # watching until the turn really settles instead of calling it a failure.
+  local deadline=$((SECONDS + 150))
+  while [ "$reason" = pending-approval ] || [ "$reason" = timeout ]; do
+    [ $SECONDS -ge $deadline ] && break
+    SNAP=""; w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
+  done
+  ans=$(jq -r '.lastAssistant // ""' <<<"$w")
+  if [ "$reason" = settled ] && [[ $ans == *PONG* ]]; then pong_s=$((SECONDS - t0)); else fail=1; echo "selftest: PONG leg failed ($reason): $w" >&2; fi
 
+  # If the model already called back during the PONG leg and the approver
+  # accepted it, the callback leg is proven — do not force a second one.
+  local early_acc=0
   if [ $fail -eq 0 ]; then
+    SNAP=""; early_acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
+  fi
+  if [ $fail -eq 0 ] && [ "$early_acc" -ge 1 ]; then
+    cb_s="0"; echo "selftest: callback already made and auto-approved during the PONG leg" >&2
+  elif [ $fail -eq 0 ]; then
     t0=$SECONDS
     SNAP=""; cmd_say "$tid" "Run exactly this command and nothing else: $NOTIFY_BIN --thread $tid --status done \"t3ctl selftest callback\"" >/dev/null
     local deadline=$((SECONDS + 150))
