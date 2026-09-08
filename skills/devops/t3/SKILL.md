@@ -124,12 +124,16 @@ create the hermes cron yourself and tell the user what you scheduled.
   working sessions**: read and continue them freely, but never
   `stop`/`interrupt`/`rm` them (t3ctl refuses), and never pass `--force`
   unless the user explicitly named that thread and asked.
+- Never start a thread from an unattended run (a webhook-triggered lane
+  with nobody watching); t3 threads are only started from conversations with
+  people. Boxes enforce this with `T3CTL_DENY_ORIGINS`.
 - No `--full-access` on threads YOU create unless the user explicitly says the
   session may run unattended.
 - One thread per task; don't retry a failed `new` in a loop (there is a
   running-threads cap and it exists to stop exactly that).
-- `t3ctl` errors are actionable: 401 → run `systemctl start t3-token-renew`
-  and retry; connection refused → `systemctl status t3` and `df -h /` (a full
+- `t3ctl` errors are actionable: 401 → rotate the token (the error says how:
+  `systemctl start t3-token-renew` on a devbox, `t3ctl token renew` in a
+  container) and retry; connection refused → `systemctl status t3` and `df -h /` (a full
   disk looks like a network failure on this box).
 
 ## Answering "what's t3 doing?" / "what's unsettled?"
