@@ -41,8 +41,9 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
 ## The normal flow
 
 1. `t3ctl new <project> "Fix the failing X test …"` — starts a thread
-   in **approval-required** mode: the session pauses and asks before running
-   commands or editing files. That is the default on purpose; keep it.
+   in the deployment's default mode (`T3CTL_DEFAULT_MODE`; approval-required
+   pauses and asks before running commands or editing files, full-access runs
+   unattended). Don't pass a mode yourself; the default is the operator's choice.
    Model: without `--model`, t3ctl copies the project's most recent
    thread's model (whatever the user used last — it can be codex). Name it when it
    matters: "use codex" → `--model codex`, "with opus" →
@@ -127,8 +128,9 @@ create the hermes cron yourself and tell the user what you scheduled.
 - Never start a thread from an unattended run (a webhook-triggered lane
   with nobody watching); t3 threads are only started from conversations with
   people. Boxes enforce this with `T3CTL_DENY_ORIGINS`.
-- No `--full-access` on threads YOU create unless the user explicitly says the
-  session may run unattended.
+- Never pass `--full-access` yourself; the deployment default decides. If the
+  default is approval-required, a thread only runs unattended when the user
+  explicitly says so.
 - One thread per task; don't retry a failed `new` in a loop (there is a
   running-threads cap and it exists to stop exactly that).
 - `t3ctl` errors are actionable: 401 → rotate the token (the error says how:

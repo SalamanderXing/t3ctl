@@ -18,8 +18,10 @@
 # from the source map: docs/t3-hermes-control.md §4 and docs/COMPAT.md.
 #
 # Guardrails (deliberate, do not quietly remove):
-#   - new/say start turns in approval-required mode unless --full-access,
-#     and --full-access only exists when T3CTL_ALLOW_FULL_ACCESS=1 (default).
+#   - new starts turns in T3CTL_DEFAULT_MODE (approval-required unless the
+#     deployment says otherwise), say inherits the thread's mode, and
+#     --full-access / a full-access default only exist when
+#     T3CTL_ALLOW_FULL_ACCESS=1 (default).
 #   - new refuses while >= T3CTL_MAX_RUNNING tagged turns are already running.
 #   - stop/interrupt/rm refuse threads not titled "$T3CTL_TAG …" without
 #     --force (those are the owner's own sessions, not ours to kill).
@@ -44,6 +46,12 @@ TAG=${T3CTL_TAG:-[agent]}
 NOTIFY_CMD=${T3CTL_NOTIFY_BIN:-${T3CTL_NOTIFY_CMD:-t3-notify}}   # the callback command sessions run
 NOTIFY_BIN=$NOTIFY_CMD   # same thing; selftest and the approver use this name
 ALLOW_FULL=${T3CTL_ALLOW_FULL_ACCESS:-1}
+DEFAULT_MODE=${T3CTL_DEFAULT_MODE:-approval-required}   # mode `new` starts threads in
+case $DEFAULT_MODE in
+  approval-required|auto-accept-edits|auto) ;;
+  full-access) [ "$ALLOW_FULL" = 1 ] || { echo "t3ctl: T3CTL_DEFAULT_MODE=full-access ignored (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL); using approval-required" >&2; DEFAULT_MODE=approval-required; };;
+  *) echo "t3ctl: invalid T3CTL_DEFAULT_MODE '$DEFAULT_MODE'; using approval-required" >&2; DEFAULT_MODE=approval-required;;
+esac
 DENY_ORIGINS=${T3CTL_DENY_ORIGINS:-}
 TEXT_CAP=${T3CTL_TEXT_CAP:-3000}   # chars of message text shown per message
 
@@ -353,7 +361,8 @@ cmd_list() {
 }
 
 cmd_new() {
-  local project="" prompt="" title="" mode=approval-required imode=default explicit="" model=""
+  local project="" prompt="" title="" mode=$DEFAULT_MODE imode=default explicit="" model=""
+  [ "$mode" = full-access ] && explicit=explicit   # deployment default, already gated above
   while [ $# -gt 0 ]; do case $1 in
     --title) title=$2; shift 2;;
     --plan) imode=plan; shift;;

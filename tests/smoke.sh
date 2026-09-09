@@ -156,6 +156,14 @@ assert_contains "$(cat "$TMP/err")" "pass --full-access" "mode full-access refus
 out=$(T3CTL_ALLOW_FULL_ACCESS=1 "$T3CTL" new aikosmo-monorepo "x" --full-access --model codex:gpt-5.6-sol)
 assert_contains "$out" '"mode":"full-access"' "full-access allowed only when enabled"
 ok "full-access gate: refused at 0, allowed by default, always needs the explicit flag"
+out=$(env -u T3CTL_ALLOW_FULL_ACCESS T3CTL_DEFAULT_MODE=full-access T3CTL_MAX_RUNNING=10 "$T3CTL" new aikosmo-monorepo "x" --model codex:gpt-5.6-sol)
+assert_contains "$out" '"mode":"full-access"' "T3CTL_DEFAULT_MODE=full-access makes new start full-access"
+"$T3CTL" stop "$(jq -r .threadId <<<"$out")" >/dev/null
+out=$(T3CTL_DEFAULT_MODE=full-access T3CTL_MAX_RUNNING=10 "$T3CTL" new aikosmo-monorepo "x" --model codex:gpt-5.6-sol 2>"$TMP/err")
+assert_contains "$out" '"mode":"approval-required"' "full-access default falls back when T3CTL_ALLOW_FULL_ACCESS=0"
+assert_contains "$(cat "$TMP/err")" "T3CTL_DEFAULT_MODE=full-access ignored" "fallback is announced"
+"$T3CTL" stop "$(jq -r .threadId <<<"$out")" >/dev/null
+ok "T3CTL_DEFAULT_MODE: honoured when allowed, falls back when not"
 
 # ---- 4. running cap ---------------------------------------------------------
 if T3CTL_MAX_RUNNING=1 "$T3CTL" new aikosmo-monorepo "y" --model codex:gpt-5.6-sol 2>"$TMP/err"; then fail "running cap not enforced"; fi
