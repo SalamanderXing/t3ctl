@@ -71,7 +71,9 @@ T3CTL_DENY_ORIGINS=webhook:auto-demo   # unattended Hermes lanes may never reach
 
 A box whose operator wants the agent's threads to run unattended sets
 `T3CTL_ALLOW_FULL_ACCESS=1` and `T3CTL_DEFAULT_MODE=full-access` in the
-container env; `new` then starts threads full-access without the flag.
+container env; `new` then starts threads full-access without the flag, and
+`new --mode <other>` is refused (an agent that read an older skill text tried
+to "fix" a full-access thread back to approval-required, 2026-09-09).
 
 and the entrypoint runs `t3ctl approve-callbacks --loop 15` itself instead of
 the systemd unit. Extra commands that exist for fresh servers: `project add

@@ -164,6 +164,9 @@ assert_contains "$out" '"mode":"approval-required"' "full-access default falls b
 assert_contains "$(cat "$TMP/err")" "T3CTL_DEFAULT_MODE=full-access ignored" "fallback is announced"
 "$T3CTL" stop "$(jq -r .threadId <<<"$out")" >/dev/null
 ok "T3CTL_DEFAULT_MODE: honoured when allowed, falls back when not"
+if env -u T3CTL_ALLOW_FULL_ACCESS T3CTL_DEFAULT_MODE=full-access "$T3CTL" new aikosmo-monorepo "x" --mode approval-required --model codex:gpt-5.6-sol 2>"$TMP/err"; then fail "--mode must not override a deployment-fixed T3CTL_DEFAULT_MODE"; fi
+assert_contains "$(cat "$TMP/err")" "fixes the mode of new threads to full-access" "fixed-mode refusal names the mode"
+ok "T3CTL_DEFAULT_MODE set → new --mode cannot downgrade/upgrade it"
 
 # ---- 4. running cap ---------------------------------------------------------
 if T3CTL_MAX_RUNNING=1 "$T3CTL" new aikosmo-monorepo "y" --model codex:gpt-5.6-sol 2>"$TMP/err"; then fail "running cap not enforced"; fi

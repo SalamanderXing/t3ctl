@@ -47,6 +47,7 @@ NOTIFY_CMD=${T3CTL_NOTIFY_BIN:-${T3CTL_NOTIFY_CMD:-t3-notify}}   # the callback 
 NOTIFY_BIN=$NOTIFY_CMD   # same thing; selftest and the approver use this name
 ALLOW_FULL=${T3CTL_ALLOW_FULL_ACCESS:-1}
 DEFAULT_MODE=${T3CTL_DEFAULT_MODE:-approval-required}   # mode `new` starts threads in
+MODE_FIXED=${T3CTL_DEFAULT_MODE:+1}   # set explicitly by the deployment → `new --mode` may not override it
 case $DEFAULT_MODE in
   approval-required|auto-accept-edits|auto) ;;
   full-access) [ "$ALLOW_FULL" = 1 ] || { echo "t3ctl: T3CTL_DEFAULT_MODE=full-access ignored (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL); using approval-required" >&2; DEFAULT_MODE=approval-required; };;
@@ -367,7 +368,11 @@ cmd_new() {
     --title) title=$2; shift 2;;
     --plan) imode=plan; shift;;
     --model) model=$2; shift 2;;
-    --mode) check_mode "$2"; mode=$2; shift 2;;
+    --mode) check_mode "$2"
+            if [ -n "$MODE_FIXED" ] && [ "$2" != "$DEFAULT_MODE" ]; then
+              die "this deployment fixes the mode of new threads to $DEFAULT_MODE (T3CTL_DEFAULT_MODE); drop --mode and run \`new\` again"
+            fi
+            mode=$2; shift 2;;
     --full-access) [ "$ALLOW_FULL" = 1 ] || die "full-access is disabled on this deployment (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL)"; mode=full-access; explicit=explicit; shift;;
     -*) die "unknown flag $1";;
     *) if [ -z "$project" ]; then project=$1; elif [ -z "$prompt" ]; then prompt=$1; else die "unexpected arg: $1"; fi; shift;;

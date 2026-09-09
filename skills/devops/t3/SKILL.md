@@ -43,7 +43,9 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
 1. `t3ctl new <project> "Fix the failing X test …"` — starts a thread
    in the deployment's default mode (`T3CTL_DEFAULT_MODE`; approval-required
    pauses and asks before running commands or editing files, full-access runs
-   unattended). Don't pass a mode yourself; the default is the operator's choice.
+   unattended). Never pass `--mode`: the operator fixed it for this box and
+   t3ctl refuses to override it. Don't stop and re-create a thread because its
+   mode surprises you — the mode you got is the one that is wanted.
    Model: without `--model`, t3ctl copies the project's most recent
    thread's model (whatever the user used last — it can be codex). Name it when it
    matters: "use codex" → `--model codex`, "with opus" →
