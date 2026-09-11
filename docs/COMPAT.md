@@ -9,6 +9,7 @@ is `t3-hermes-control.md` §4.
 | t3ctl | t3 (`T3_VERSION`) | hermes-agent | verified | notes |
 |---|---|---|---|---|
 | v0.1.0 | 0.0.39-nightly.20260904.1280 | v0.21.0 (2026.8.31) | 2026-09-08 | selftest: PONG 9 s, callback auto-approved ~20 s; search OK; WebSocket ticket param is `wsTicket` |
+| v0.1.0 | 0.0.41-nightly.20260911.1533 | v0.21.0 (2026.8.31) | 2026-09-11 | list/search OK; probe thread's callback (`Bash: t3-notify …` detail) auto-approved unattended within one 15 s cycle. `selftest` itself reported FAILED spuriously: the model ran the callback during the PONG leg with a `;` in its summary, which the approver refuses by design. Installing this nightly needs `npm_config_legacy_peer_deps=true` (npm loops on its effect peer pins) |
 
 Known fragile points, in the order they have actually broken or are most
 likely to:
