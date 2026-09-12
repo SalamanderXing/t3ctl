@@ -41,8 +41,11 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
 ## The normal flow
 
 1. `t3ctl new <project> "Fix the failing X test …"` — starts a thread
-   in **approval-required** mode: the session pauses and asks before running
-   commands or editing files. That is the default on purpose; keep it.
+   in the deployment's default mode (`T3CTL_DEFAULT_MODE`; approval-required
+   pauses and asks before running commands or editing files, full-access runs
+   unattended). Never pass `--mode`: the operator fixed it for this box and
+   t3ctl refuses to override it. Don't stop and re-create a thread because its
+   mode surprises you — the mode you got is the one that is wanted.
    Model: without `--model`, t3ctl copies the project's most recent
    thread's model (whatever the user used last — it can be codex). Name it when it
    matters: "use codex" → `--model codex`, "with opus" →
@@ -124,12 +127,17 @@ create the hermes cron yourself and tell the user what you scheduled.
   working sessions**: read and continue them freely, but never
   `stop`/`interrupt`/`rm` them (t3ctl refuses), and never pass `--force`
   unless the user explicitly named that thread and asked.
-- No `--full-access` on threads YOU create unless the user explicitly says the
-  session may run unattended.
+- Never start a thread from an unattended run (a webhook-triggered lane
+  with nobody watching); t3 threads are only started from conversations with
+  people. Boxes enforce this with `T3CTL_DENY_ORIGINS`.
+- Never pass `--full-access` yourself; the deployment default decides. If the
+  default is approval-required, a thread only runs unattended when the user
+  explicitly says so.
 - One thread per task; don't retry a failed `new` in a loop (there is a
   running-threads cap and it exists to stop exactly that).
-- `t3ctl` errors are actionable: 401 → run `systemctl start t3-token-renew`
-  and retry; connection refused → `systemctl status t3` and `df -h /` (a full
+- `t3ctl` errors are actionable: 401 → rotate the token (the error says how:
+  `systemctl start t3-token-renew` on a devbox, `t3ctl token renew` in a
+  container) and retry; connection refused → `systemctl status t3` and `df -h /` (a full
   disk looks like a network failure on this box).
 
 ## Answering "what's t3 doing?" / "what's unsettled?"

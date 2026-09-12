@@ -55,10 +55,41 @@ Pin the tag in the box's own repo and have its drift check compare
 `/var/lib/t3ctl/version` (written by install.sh) against the pin.
 `/var/lib/t3ctl/manifest.sha256` lists every installed path with its hash.
 
+## Container mode (Kosmi)
+
+The same tooling runs inside a Hermes container where there is no systemd
+and t3ctl runs as the same user and `T3CODE_HOME` as the t3 server. The box
+sets in `/etc/t3ctl.conf`:
+
+```
+T3CTL_TOKEN_MODE=self          # t3ctl mints/rotates its own session (flock-serialised, retried once on 401)
+T3CODE_HOME=/data/t3
+T3CTL_TOKEN_FILE=/data/t3/t3ctl.token
+T3CTL_ALLOW_FULL_ACCESS=${T3CTL_ALLOW_FULL_ACCESS:-0}   # --full-access refused unless the box env opts in
+T3CTL_DENY_ORIGINS=webhook:auto-demo   # unattended Hermes lanes may never reach t3
+```
+
+A box whose operator wants the agent's threads to run unattended sets
+`T3CTL_ALLOW_FULL_ACCESS=1` and `T3CTL_DEFAULT_MODE=full-access` in the
+container env; `new` then starts threads full-access without the flag, and
+`new --mode <other>` is refused (an agent that read an older skill text tried
+to "fix" a full-access thread back to approval-required, 2026-09-09).
+
+and the entrypoint runs `t3ctl approve-callbacks --loop 15` itself instead of
+the systemd unit. Extra commands that exist for fresh servers: `project add
+<path>`, `project set-model <project> <instanceId:model>`, a literal
+`--model instanceId:model`, `token status|renew`, and `contract-check` (a
+read-only probe of every API/schema contract, for version bumps; `selftest`
+stays the end-to-end probe). `tests/smoke.sh` exercises all of this against
+`tests/fake_t3_server.py` without a real t3.
+
 ## Why the pieces exist
 
-- **Guardrails are in t3ctl, not the API.** `new` starts threads
-  approval-required with a title tag; `--full-access` must be spelled out;
+- **Guardrails are in t3ctl, not the API.** `new` starts threads in
+  `T3CTL_DEFAULT_MODE` (approval-required unless the deployment says
+  otherwise; a full-access default needs `T3CTL_ALLOW_FULL_ACCESS=1` and
+  falls back to approval-required with a warning otherwise) with a title
+  tag; `--full-access` must be spelled out;
   `new` refuses at `T3CTL_MAX_RUNNING` running tagged turns; `stop`/
   `interrupt`/`rm` refuse untagged threads without `--force`; `say` inherits
   the target thread's mode.

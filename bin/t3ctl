@@ -2,32 +2,58 @@
 # t3ctl — drive T3 Code sessions from an agent (Hermes). JSON out.
 #
 # Thin wrapper over t3's local orchestration HTTP API (127.0.0.1:3773) — the
-# same authenticated API the desktop app drives. Auth is a bearer token that
-# t3-token-renew (weekly timer) mints as the t3 user and writes root-only;
-# this script re-reads it on every invocation.
+# same authenticated API the desktop app drives.
 #
-# Configuration: /etc/t3ctl.conf (see t3ctl.conf.example); every T3CTL_* below
-# can also come from the environment.
+# Configuration: /etc/t3ctl.conf (see t3ctl.conf.example; override the path
+# with T3CTL_CONF); every T3CTL_* below can also come from the environment.
+#
+# Two token modes:
+#   file (default, devbox): t3-token-renew (weekly timer) mints as the t3 user
+#        and writes the token root-only; t3ctl re-reads it per invocation.
+#   self (containers): t3ctl runs as the same user and T3CODE_HOME as the t3
+#        server and mints/rotates its own 30 d session on first use and on 401.
 #
 # The API is internal to the pinned t3 nightly. If commands break after a
-# T3_VERSION bump, re-extract the contracts from the source map: see
-# docs/t3-hermes-control.md §4 and docs/COMPAT.md in the t3ctl repo.
+# T3_VERSION bump, run `t3ctl contract-check`, then re-extract the contracts
+# from the source map: docs/t3-hermes-control.md §4 and docs/COMPAT.md.
 #
 # Guardrails (deliberate, do not quietly remove):
-#   - new/say start turns in approval-required mode unless --full-access.
-#   - new refuses while >= T3CTL_MAX_RUNNING turns are already running.
+#   - new starts turns in T3CTL_DEFAULT_MODE (approval-required unless the
+#     deployment says otherwise), say inherits the thread's mode, and
+#     --full-access / a full-access default only exist when
+#     T3CTL_ALLOW_FULL_ACCESS=1 (default).
+#   - new refuses while >= T3CTL_MAX_RUNNING tagged turns are already running.
 #   - stop/interrupt/rm refuse threads not titled "$T3CTL_TAG …" without
 #     --force (those are the owner's own sessions, not ours to kill).
+#   - T3CTL_DENY_ORIGINS refuses every command from listed Hermes session
+#     origins (unattended webhook lanes), see origin_gate below.
 set -uo pipefail
 
-# shellcheck disable=SC1091
-[ -r /etc/t3ctl.conf ] && . /etc/t3ctl.conf
+# shellcheck disable=SC1090
+T3CTL_CONF=${T3CTL_CONF:-/etc/t3ctl.conf}
+[ -r "$T3CTL_CONF" ] && . "$T3CTL_CONF"
 BASE=${T3CTL_URL:-http://127.0.0.1:3773}
+T3_HOME=${T3CODE_HOME:-${T3CTL_T3_HOME:-/data/t3}}
+T3_BIN=${T3CTL_T3_BIN:-t3}
+TOKEN_MODE=${T3CTL_TOKEN_MODE:-file}
 TOKEN_FILE=${T3CTL_TOKEN_FILE:-/etc/t3ctl/token}
+SESSION_FILE=${T3CTL_SESSION_FILE:-/etc/t3ctl/session-id}
+TOKEN_TTL=${T3CTL_TOKEN_TTL:-30d}
+TOKEN_LABEL=${T3CTL_TOKEN_LABEL:-t3ctl}
 DB=${T3CTL_DB:-/data/home/dev/.t3/userdata/state.sqlite}
 MAX_RUNNING=${T3CTL_MAX_RUNNING:-3}
 TAG=${T3CTL_TAG:-[agent]}
-NOTIFY_BIN=${T3CTL_NOTIFY_BIN:-t3-notify}   # the callback command sessions run
+NOTIFY_CMD=${T3CTL_NOTIFY_BIN:-${T3CTL_NOTIFY_CMD:-t3-notify}}   # the callback command sessions run
+NOTIFY_BIN=$NOTIFY_CMD   # same thing; selftest and the approver use this name
+ALLOW_FULL=${T3CTL_ALLOW_FULL_ACCESS:-1}
+DEFAULT_MODE=${T3CTL_DEFAULT_MODE:-approval-required}   # mode `new` starts threads in
+MODE_FIXED=${T3CTL_DEFAULT_MODE:+1}   # set explicitly by the deployment → `new --mode` may not override it
+case $DEFAULT_MODE in
+  approval-required|auto-accept-edits|auto) ;;
+  full-access) [ "$ALLOW_FULL" = 1 ] || { echo "t3ctl: T3CTL_DEFAULT_MODE=full-access ignored (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL); using approval-required" >&2; DEFAULT_MODE=approval-required; };;
+  *) echo "t3ctl: invalid T3CTL_DEFAULT_MODE '$DEFAULT_MODE'; using approval-required" >&2; DEFAULT_MODE=approval-required;;
+esac
+DENY_ORIGINS=${T3CTL_DENY_ORIGINS:-}
 TEXT_CAP=${T3CTL_TEXT_CAP:-3000}   # chars of message text shown per message
 
 die() { echo "t3ctl: $*" >&2; exit 1; }
@@ -59,44 +85,129 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
                                           decline | cancel
   t3ctl approve-callbacks [--loop S] [--dry-run]
                                           auto-accept pending approvals that are
-                                          exactly a callback (T3CTL_NOTIFY_BIN),
-                                          in tagged threads only (what
-                                          t3-callback-approver.service runs)
+                                          exactly a $T3CTL_NOTIFY_CMD callback, in
+                                          threads tagged $T3CTL_TAG only
+  t3ctl project add <path> [--title T]    register a workspace as a project
+  t3ctl project set-model <project> <instanceId>:<model>
+                                          set the project's default model
+  t3ctl token [status|renew]              show / rotate the bearer session
+                                          (renew needs T3CTL_TOKEN_MODE=self;
+                                          file mode rotates via t3-token-renew)
   t3ctl selftest [--project P]            end-to-end probe: new → PONG, forced
                                           callback → auto-approved → settled,
                                           then rm; JSON verdict, exit 1 on fail
+  t3ctl contract-check                    read-only probe of every API/schema
+                                          contract this build depends on
   t3ctl interrupt <thread> [--force]      interrupt the running turn
   t3ctl stop <thread> [--force]           stop the provider session
   t3ctl rm <thread> [--force]             delete the thread
 
 <thread> and <project> accept a full id, a unique id prefix, or (projects)
-an exact title / workspaceRoot basename. Tag = T3CTL_TAG. Modes: approval-required,
+an exact title / workspaceRoot basename. Modes: approval-required,
 auto-accept-edits, auto, full-access. --model takes a model name or
-instance id from `t3ctl models` (e.g. codex, claude-opus-5); without it the
-project default is used.
+instance id from `t3ctl models` (e.g. codex, claude-opus-5), or a literal
+instanceId:model pair (claudeAgent:claude-fable-5-1) on a fresh server;
+without it the project default is used. Tag = T3CTL_TAG.
 EOF
   exit 0
 }
 
-for c in curl jq uuidgen; do command -v "$c" >/dev/null || die "missing dependency: $c"; done
+for c in curl jq uuidgen flock; do command -v "$c" >/dev/null || die "missing dependency: $c"; done
+
+# Origin gate. Hermes bridges the calling session's identity into every
+# command's env (gateway/session_context.py _VAR_MAP: HERMES_SESSION_PLATFORM,
+# HERMES_SESSION_CHAT_ID = "webhook:<route>:<delivery>", HERMES_SESSION_CHAT_NAME
+# = "webhook/<route>"). Unattended, externally triggered lanes (a webhook
+# route running with session yolo) must never reach t3 — not even to read.
+# T3CTL_DENY_ORIGINS is a comma-separated list of prefixes matched against
+# the chat id and the chat name (e.g. "webhook:auto-demo"). Empty = no gate.
+# Interactive shells (no session vars) and the approver loop are not gated.
+origin_gate() {
+  local plat=${HERMES_SESSION_PLATFORM:-} cid=${HERMES_SESSION_CHAT_ID:-} name=${HERMES_SESSION_CHAT_NAME:-} rule
+  [ -n "$plat" ] || [ -n "$cid" ] || [ -n "$name" ] || return 0
+  local IFS=,
+  for rule in $DENY_ORIGINS; do
+    [ -n "$rule" ] || continue
+    case "$cid" in "$rule"*) die "refused: t3ctl is not available from this lane ($plat $cid) — coding threads are only started from conversations with people";; esac
+    case "$name" in "$rule"*) die "refused: t3ctl is not available from this lane ($plat $name) — coding threads are only started from conversations with people";; esac
+  done
+}
+origin_gate
+
+# num FLAG VALUE — numeric flags must error on non-numeric input, not fail
+# later inside arithmetic, sqlite or sleep with a misleading message.
+num() { [[ ${2:-} =~ ^[0-9]+$ ]] || die "$1 expects a non-negative integer, got '${2:-}'"; }
+
+# Self-service token: in T3CTL_TOKEN_MODE=self t3ctl runs as the same user and
+# T3CODE_HOME as the t3 server (the Kosmi container), so it mints its own
+# bearer session, probes it before installing it, and revokes the predecessor.
+# `auth session issue` has no --scopes flag: the token carries every scope
+# (incl. access:write) — accepted knowingly; the file mode (0600) and the
+# approvals.deny glob on it are the only narrowing available.
+# $1 = the token that just failed (empty when there was none). Serialised
+# with flock: concurrent t3ctl calls (the approver loop + the agent) can hit
+# a 401 together, and two unsynchronised rotations would interleave the
+# token/session files and revoke the wrong session.
+mint_token() {
+  local failed=${1:-}
+  mkdir -p "$(dirname "$TOKEN_FILE")"
+  (
+    flock -w 60 9 || { echo "t3ctl: could not lock $TOKEN_FILE.lock" >&2; exit 1; }
+    # Someone else may have rotated while we waited for the lock.
+    if [ -s "$TOKEN_FILE" ]; then
+      cur=$(tr -d ' \t\n' < "$TOKEN_FILE")
+      if [ -n "$cur" ] && [ "$cur" != "$failed" ] \
+         && curl -sf -m 15 -H "Authorization: Bearer $cur" "$BASE/api/orchestration/shell" -o /dev/null; then
+        echo "t3ctl: token already rotated by another process" >&2
+        exit 0
+      fi
+    fi
+    # </dev/null: the t3 CLI blocks on an open (non-tty) stdin — seen 2026-09-08.
+    out=$(T3CODE_HOME="$T3_HOME" "$T3_BIN" auth session issue --ttl "$TOKEN_TTL" --label "$TOKEN_LABEL" --json 2>&1 </dev/null) \
+      || { echo "t3ctl: '$T3_BIN auth session issue' failed: $(tail -c 300 <<<"$out")" >&2; exit 1; }
+    tok=$(jq -r '.token // empty' <<<"$out"); sid=$(jq -r '.sessionId // empty' <<<"$out")
+    [ -n "$tok" ] && [ -n "$sid" ] || { echo "t3ctl: could not parse token/sessionId from 'auth session issue' output" >&2; exit 1; }
+    curl -sSf -m 30 -H "Authorization: Bearer $tok" "$BASE/api/orchestration/shell" -o /dev/null \
+      || { echo "t3ctl: freshly minted token failed its probe against $BASE (t3 down, or the internal API changed after a t3 bump — see docs/t3-hermes-control.md §4)" >&2; exit 1; }
+    old_sid=$(cat "$SESSION_FILE" 2>/dev/null || true)
+    umask 077
+    printf '%s\n' "$tok" > "$TOKEN_FILE.tmp" && mv "$TOKEN_FILE.tmp" "$TOKEN_FILE" || exit 1
+    printf '%s\n' "$sid" > "$SESSION_FILE.tmp" && mv "$SESSION_FILE.tmp" "$SESSION_FILE" || exit 1
+    if [ -n "$old_sid" ] && [ "$old_sid" != "$sid" ]; then
+      T3CODE_HOME="$T3_HOME" "$T3_BIN" auth session revoke "$old_sid" >/dev/null 2>&1 </dev/null \
+        || echo "t3ctl: warning: could not revoke previous session $old_sid (it expires by TTL)" >&2
+    fi
+    echo "t3ctl: minted session $sid (ttl $TOKEN_TTL) -> $TOKEN_FILE" >&2
+  ) 9>"$TOKEN_FILE.lock"
+}
 
 token() {
-  [ -r "$TOKEN_FILE" ] || die "cannot read $TOKEN_FILE (root only; mint with: systemctl start t3-token-renew)"
+  if [ ! -s "$TOKEN_FILE" ]; then
+    [ "$TOKEN_MODE" = self ] || die "cannot read $TOKEN_FILE (root only; mint with: systemctl start t3-token-renew)"
+    mint_token "" || die "could not mint a t3 session token"
+  fi
   tr -d ' \t\n' < "$TOKEN_FILE"
 }
 
 api() { # api METHOD PATH [JSON_BODY]
-  local method=$1 path=$2 body=${3:-} out code resp
-  local args=(-sS -m 60 -X "$method" -H "Authorization: Bearer $(token)" -w $'\n%{http_code}')
+  local method=$1 path=$2 body=${3:-} out code resp tok
+  tok=$(token) || exit 1
+  local args=(-sS -m 60 -X "$method" -H "Authorization: Bearer $tok" -w $'\n%{http_code}')
   [ -n "$body" ] && args+=(-H "Content-Type: application/json" --data "$body")
-  out=$(curl "${args[@]}" "$BASE$path") || die "cannot reach t3 at $BASE — check 'systemctl status t3', and 'df -h /' (a full disk presents exactly like this)"
+  out=$(curl "${args[@]}" "$BASE$path") || die "cannot reach t3 at $BASE — is the t3 server up? (a full disk presents exactly like this: check df -h)"
   code=${out##*$'\n'}
   resp=${out%$'\n'*}
+  if { [ "$code" = 401 ] || [ "$code" = 403 ]; } && [ "$TOKEN_MODE" = self ] && [ "${_T3CTL_RETRIED:-0}" = 0 ]; then
+    # Expired/revoked session: rotate once and retry the same call.
+    mint_token "$tok" || die "HTTP $code and re-minting a session failed"
+    _T3CTL_RETRIED=1 api "$method" "$path" "$body"
+    return
+  fi
   if [ "$code" != 200 ]; then
     echo "$resp" >&2
     case $code in
-      401|403) die "HTTP $code — token expired or revoked; run: systemctl start t3-token-renew" ;;
-      *) die "HTTP $code from $method $path (if this started after a T3_VERSION bump, the internal API changed — see hetzner-stack/t3-hermes-control.md)" ;;
+      401|403) if [ "$TOKEN_MODE" = self ]; then die "HTTP $code — token expired or revoked; run: t3ctl token renew"; else die "HTTP $code — token expired or revoked; run: systemctl start t3-token-renew"; fi ;;
+      *) die "HTTP $code from $method $path (if this started after a T3_VERSION bump, the internal API changed — run t3ctl contract-check, see docs/t3-hermes-control.md §4)" ;;
     esac
   fi
   printf '%s' "$resp"
@@ -111,8 +222,10 @@ check_mode() {
   case $1 in approval-required|auto-accept-edits|auto|full-access) ;; *)
     die "invalid mode '$1' (approval-required|auto-accept-edits|auto|full-access)";;
   esac
-  [ "$1" = full-access ] && [ "${2:-}" != explicit ] && \
-    die "full-access via --mode is refused; pass --full-access if you really mean it"
+  if [ "$1" = full-access ]; then
+    [ "$ALLOW_FULL" = 1 ] || die "full-access is disabled on this deployment (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL)"
+    [ "${2:-}" = explicit ] || die "full-access via --mode is refused; pass --full-access if you really mean it"
+  fi
   return 0
 }
 
@@ -158,14 +271,21 @@ resolve_model() { # $1: model name / instanceId / "instance:model" → selection
      | select(.sel.model == $q or .sel.instanceId == $q
               or ((.sel.instanceId + ":" + (.sel.model // "")) == $q))]
     | sort_by(.at) | last | .sel // empty' <<<"$SNAP")
-  [ -n "$m" ] || die "no thread on this server has used model '$q' — pick from: $(jq -r '[.threads[].modelSelection | select(. != null) | (.instanceId + ":" + (.model // ""))] | unique | join(", ")' <<<"$SNAP")"
+  if [ -z "$m" ]; then
+    # Literal instanceId:model — the only way to pick a model on a server no
+    # thread has used yet (fresh deployment). No options come along.
+    case $q in
+      *:*) m=$(jq -cn --arg i "${q%%:*}" --arg mo "${q#*:}" '{instanceId:$i, model:$mo}');;
+      *) die "no thread on this server has used model '$q' — pick from: $(jq -r '[.threads[].modelSelection | select(. != null) | (.instanceId + ":" + (.model // ""))] | unique | join(", ")' <<<"$SNAP"), or pass a literal instanceId:model";;
+    esac
+  fi
   printf '%s' "$m"
 }
 
 require_ours_or_force() { # $1: force flag (true/false)
   [ "$1" = true ] && return 0
   jq -e --arg tag "$TAG" '.title | startswith($tag)' >/dev/null <<<"$THREAD" || \
-    die "thread '$(jq -r .title <<<"$THREAD")' was not created by t3ctl ($TAG prefix); this is likely the owner's own session — pass --force only if they explicitly asked"
+    die "thread '$(jq -r .title <<<"$THREAD")' was not created by t3ctl ($TAG prefix); this is somebody else's session — pass --force only when explicitly asked to kill it"
 }
 
 wait_turn_visible() { # $1 threadId  $2 previous turnId (or "none") → echoes state
@@ -177,10 +297,12 @@ wait_turn_visible() { # $1 threadId  $2 previous turnId (or "none") → echoes s
     cur=$(shell_snap | jq -r --arg id "$tid" \
       '.threads[] | select(.id == $id) | [.latestTurn.turnId // "none", .latestTurn.state // "none"] | join(" ")')
     state=${cur#* }
-    [ "${cur%% *}" != "$old" ] && break
+    [ "${cur%% *}" != "$old" ] && { echo "$state"; return 0; }
     sleep 2
   done
-  echo "$state"
+  # Still the previous turn after ~16 s: say so instead of handing back the
+  # old turn's state, which a follow-up `watch` would misread as settled.
+  echo "not-visible"
 }
 
 turn_json() { # $1 threadId  $2 text  $3 mode  $4 interactionMode  [$5 modelSelection]
@@ -240,13 +362,18 @@ cmd_list() {
 }
 
 cmd_new() {
-  local project="" prompt="" title="" mode=approval-required imode=default explicit="" model=""
+  local project="" prompt="" title="" mode=$DEFAULT_MODE imode=default explicit="" model=""
+  [ "$mode" = full-access ] && explicit=explicit   # deployment default, already gated above
   while [ $# -gt 0 ]; do case $1 in
     --title) title=$2; shift 2;;
     --plan) imode=plan; shift;;
     --model) model=$2; shift 2;;
-    --mode) check_mode "$2"; mode=$2; shift 2;;
-    --full-access) mode=full-access; explicit=explicit; shift;;
+    --mode) check_mode "$2"
+            if [ -n "$MODE_FIXED" ] && [ "$2" != "$DEFAULT_MODE" ]; then
+              die "this deployment fixes the mode of new threads to $DEFAULT_MODE (T3CTL_DEFAULT_MODE); drop --mode and run \`new\` again"
+            fi
+            mode=$2; shift 2;;
+    --full-access) [ "$ALLOW_FULL" = 1 ] || die "full-access is disabled on this deployment (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL)"; mode=full-access; explicit=explicit; shift;;
     -*) die "unknown flag $1";;
     *) if [ -z "$project" ]; then project=$1; elif [ -z "$prompt" ]; then prompt=$1; else die "unexpected arg: $1"; fi; shift;;
   esac; done
@@ -277,12 +404,12 @@ cmd_new() {
   local tid; tid=$(uuid)
   # Callback + scheduling contract for the agent inside the session. The
   # thread id is only known here, so t3ctl injects it rather than the skill.
-  if command -v "$NOTIFY_BIN" >/dev/null 2>&1; then
+  if command -v "$NOTIFY_CMD" >/dev/null 2>&1; then
     prompt="$prompt
 
 ---
 Callback contract (from the dispatcher, not the task): this t3 thread's id is $tid. When you FINISH the task, become BLOCKED, or are WAITING on an approval, report it with:
-  $NOTIFY_BIN --thread $tid --status done|blocked|approval \"<one-paragraph summary>\"
+  $NOTIFY_CMD --thread $tid --status done|blocked|approval \"<one-paragraph summary>\"
 Run it as a plain command exactly in that form (double-quoted summary, no other shell syntax): that exact command is pre-approved and runs without a prompt even in approval-required mode. Notify on those state changes only — not for progress updates. Also: never schedule recurring jobs (cron, timers, self-reminders) from inside this session; they die with it. If the work needs something recurring, say so in your callback and it will be scheduled properly outside."
   fi
   local create
@@ -301,15 +428,15 @@ Run it as a plain command exactly in that form (double-quoted summary, no other 
 }
 
 cmd_say() {
-  # Continuing a thread inherits ITS runtime mode by default: tagged threads
-  # were created approval-required, and the owner's own threads keep whatever
-  # they chose — a follow-up must not quietly downgrade (or upgrade) them.
+  # Continuing a thread inherits ITS runtime mode by default: owned threads
+  # were created approval-required, and other people's threads keep whatever
+  # they chose — a follow-up must not quietly downgrade (or upgrade) a session.
   local thread="" text="" mode="" imode="" explicit="" model="" msel=null
   while [ $# -gt 0 ]; do case $1 in
     --plan) imode=plan; shift;;
     --model) model=$2; shift 2;;
     --mode) check_mode "$2"; mode=$2; shift 2;;
-    --full-access) mode=full-access; explicit=explicit; shift;;
+    --full-access) [ "$ALLOW_FULL" = 1 ] || die "full-access is disabled on this deployment (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL)"; mode=full-access; explicit=explicit; shift;;
     --inherit) shift;;   # inherit is the default; flag kept for compatibility
     -*) die "unknown flag $1";;
     *) if [ -z "$thread" ]; then thread=$1; elif [ -z "$text" ]; then text=$1; else die "unexpected arg: $1"; fi; shift;;
@@ -329,7 +456,7 @@ cmd_say() {
 cmd_show() {
   local thread="" turns=4
   while [ $# -gt 0 ]; do case $1 in
-    -n) turns=$2; shift 2;;
+    -n) num -n "${2:-}"; turns=$2; shift 2;;
     -*) die "unknown flag $1";;
     *) [ -z "$thread" ] && thread=$1 || die "unexpected arg: $1"; shift;;
   esac; done
@@ -351,10 +478,10 @@ cmd_search() {
   # from Layers/ProjectionSnapshotQuery.ts `searchActiveThreadRows` — as a
   # read-only query against t3's SQLite. That means it rides the internal
   # SCHEMA, not just the internal API: a T3_VERSION bump can break it, and
-  # the fix is re-extracting the query (t3-hermes-control.md §4).
+  # the fix is re-extracting the query (hermes/t3ctl/README.md).
   local q="" limit=20
   while [ $# -gt 0 ]; do case $1 in
-    --limit) limit=$2; shift 2;;
+    --limit) num --limit "${2:-}"; limit=$2; shift 2;;
     -*) die "unknown flag $1";;
     *) [ -z "$q" ] && q=$1 || die "unexpected arg: $1"; shift;;
   esac; done
@@ -406,7 +533,7 @@ cmd_search() {
              max(1, instr(lower(match_text), lower('${sqlq}')) - 60), 160) AS snippet
     FROM ranked WHERE thread_match_rank = 1
     ORDER BY match_rank ASC, thread_updated_at DESC, threadId ASC
-    LIMIT $((limit));" 2>&1) || die "search query failed (schema changed after a T3_VERSION bump? re-extract per t3-hermes-control.md): $(head -c 200 <<<"$rows")"
+    LIMIT $((limit));" 2>&1) || die "search query failed (schema changed after a T3_VERSION bump? re-extract per docs/t3-hermes-control.md §4): $(head -c 200 <<<"$rows")"
   [ -n "$rows" ] || rows="[]"
 
   # Merge: title hits first, then message hits for threads not already listed.
@@ -449,21 +576,20 @@ cmd_approve() {
     '{threadId:$id, requestId:$rid, decision:$d, responded:true}'
 }
 
-# The callback contract asks the session to run $NOTIFY_BIN, but in
-# approval-required mode (the default for tagged threads) running ANY command
+# The callback contract asks the session to run `$NOTIFY_CMD`, but in
+# approval-required mode (the default for owned threads) running ANY command
 # raises an approval — so an unattended thread could never report "done" or
 # "waiting on approval" without someone approving the report itself (found
 # 2026-09-08 via a probe thread). This accepts exactly that one command, in
-# tagged threads only, and nothing else: the detail must be a single
-# $NOTIFY_BIN invocation for the SAME thread id with a double-quoted summary
-# free of shell syntax.
+# owned threads only, and nothing else: the detail must be a single notify invocation
+# for the SAME thread id with a double-quoted summary free of shell syntax.
 # Anything looser (another command chained on, backticks, $(), redirects)
-# does not match and waits for a human or the agent like before.
+# does not match and waits for a human/Cactus like before.
 callback_pattern() { # $1 thread id → ERE for the approval detail
   local tid=$1
   # optional wrappers: codex shows `/usr/bin/bash -lc '<cmd>'`, claude shows
   # the bare command (sometimes `Bash: <cmd>`); summary = [^"'`$;&|<>\\]*
-  printf '%s' "^((/usr/bin/)?bash -lc '|Bash: |Run: )?$NOTIFY_BIN --thread $tid --status (done|blocked|approval) \"[^\"'\`\$;&|<>\\\\]*\"'?\$"
+  printf '%s' "^((/usr/bin/)?bash -lc '|Bash: |Run: )?$NOTIFY_CMD --thread $tid --status (done|blocked|approval) \"[^\"'\`\$;&|<>\\\\]*\"'?\$"
 }
 
 approve_callbacks_once() { # $1 dry-run true/false → prints one JSON line per action
@@ -507,7 +633,7 @@ approve_callbacks_once() { # $1 dry-run true/false → prints one JSON line per 
 cmd_approve_callbacks() {
   local loop=0 dry=false
   while [ $# -gt 0 ]; do case $1 in
-    --loop) loop=$2; shift 2;;
+    --loop) num --loop "${2:-}"; loop=$2; shift 2;;
     --dry-run) dry=true; shift;;
     *) die "usage: t3ctl approve-callbacks [--loop seconds] [--dry-run]";;
   esac; done
@@ -520,63 +646,11 @@ cmd_approve_callbacks() {
   done
 }
 
-cmd_selftest() {
-  # What a human did by hand on 2026-09-08 to prove the Hermes leg works:
-  # create a tagged thread, get PONG, force the callback command, see the
-  # approver accept it unattended, delete the probe. Run after a T3_VERSION
-  # bump and on every new box. Costs one tiny model turn.
-  local project="" tid="" fail=0 t0 pong_s="" cb_s="" reason ans w
-  while [ $# -gt 0 ]; do case $1 in
-    --project) project=$2; shift 2;;
-    *) die "usage: t3ctl selftest [--project <project>]";;
-  esac; done
-  SNAP=$(shell_snap)
-  [ -n "$project" ] || project=$(jq -r '.projects[0].title // empty' <<<"$SNAP")
-  [ -n "$project" ] || die "selftest: no project on this server"
-  command -v "$NOTIFY_BIN" >/dev/null 2>&1 || die "selftest: $NOTIFY_BIN is not installed — the callback leg cannot work"
-
-  t0=$SECONDS
-  w=$(cmd_new "$project" "Connectivity self-test. Reply with exactly the word PONG and nothing else. Do not run tools, do not read or edit files." --title "selftest $(date -u +%Y-%m-%dT%H:%M:%SZ)")
-  tid=$(jq -r .threadId <<<"$w")
-  echo "selftest: thread $tid" >&2
-  SNAP=""; w=$(cmd_watch "$tid" --timeout 120)
-  reason=$(jq -r .reason <<<"$w"); ans=$(jq -r '.lastAssistant // ""' <<<"$w")
-  if [ "$reason" = settled ] && [[ $ans == *PONG* ]]; then pong_s=$((SECONDS - t0)); else fail=1; echo "selftest: PONG leg failed: $w" >&2; fi
-
-  if [ $fail -eq 0 ]; then
-    t0=$SECONDS
-    SNAP=""; cmd_say "$tid" "Run exactly this command and nothing else: $NOTIFY_BIN --thread $tid --status done \"t3ctl selftest callback\"" >/dev/null
-    local deadline=$((SECONDS + 150))
-    while :; do
-      SNAP=""; w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
-      [ "$reason" = settled ] && break
-      # pending-approval here is expected: the approver takes up to one
-      # 15 s cycle. Anything else that is not "still running" is a failure.
-      case $reason in pending-approval|timeout) ;; *) break;; esac
-      [ $SECONDS -ge $deadline ] && break
-    done
-    if [ "$reason" = settled ] && [ "$(jq -r '.lastError // ""' <<<"$w")" = "" ]; then
-      SNAP=""; local acc; acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
-      if [ "$acc" -ge 1 ]; then cb_s=$((SECONDS - t0)); else fail=1; echo "selftest: callback settled but no accepted approval found (approver not running?)" >&2; fi
-    else
-      fail=1; echo "selftest: callback leg failed ($reason): $w" >&2
-    fi
-  fi
-
-  SNAP=""; simple_thread_cmd rm "$tid" >/dev/null || echo "selftest: could not delete probe thread $tid" >&2
-  jq -cn --arg project "$project" --arg tid "$tid" --arg pong "$pong_s" --arg cb "$cb_s" --argjson ok "$([ $fail -eq 0 ] && echo true || echo false)" \
-    '{ok:$ok, project:$project, threadId:$tid,
-      pong: (if $pong == "" then "FAILED" else ($pong + "s") end),
-      callback: (if $cb == "" then "FAILED" else ($cb + "s (approved unattended)") end),
-      deleted:true}'
-  return $fail
-}
-
 cmd_watch() {
   local thread="" timeout=900 interval=5
   while [ $# -gt 0 ]; do case $1 in
-    --timeout) timeout=$2; shift 2;;
-    --interval) interval=$2; shift 2;;
+    --timeout) num --timeout "${2:-}"; timeout=$2; shift 2;;
+    --interval) num --interval "${2:-}"; interval=$2; shift 2;;
     -*) die "unknown flag $1";;
     *) [ -z "$thread" ] && thread=$1 || die "unexpected arg: $1"; shift;;
   esac; done
@@ -642,6 +716,158 @@ simple_thread_cmd() { # $1: interrupt|stop|rm, then thread + flags
   jq -cn --arg id "$TID" --arg op "$name" '{threadId:$id, op:$op, done:true}'
 }
 
+cmd_token() {
+  case ${1:-status} in
+    status)
+      if [ -s "$TOKEN_FILE" ]; then
+        local code
+        code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' \
+          -H "Authorization: Bearer $(tr -d ' \t\n' < "$TOKEN_FILE")" "$BASE/api/orchestration/shell" || echo 000)
+        jq -cn --arg f "$TOKEN_FILE" --arg sid "$(cat "$SESSION_FILE" 2>/dev/null)" --arg code "$code" --arg mode "$TOKEN_MODE" \
+          '{tokenFile:$f, sessionId:($sid // null), probe:($code|tonumber), valid:($code=="200"), mode:$mode}'
+      else
+        jq -cn --arg f "$TOKEN_FILE" --arg mode "$TOKEN_MODE" '{tokenFile:$f, sessionId:null, probe:null, valid:false, mode:$mode}'
+      fi;;
+    renew)
+      [ "$TOKEN_MODE" = self ] || die "T3CTL_TOKEN_MODE=$TOKEN_MODE: this box rotates the token with t3-token-renew (systemctl start t3-token-renew)"
+      mint_token "$(tr -d ' \t\n' < "$TOKEN_FILE" 2>/dev/null)" || exit 1
+      jq -cn --arg f "$TOKEN_FILE" --arg sid "$(cat "$SESSION_FILE" 2>/dev/null)" '{tokenFile:$f, sessionId:$sid, renewed:true}';;
+    *) die "usage: t3ctl token [status|renew]";;
+  esac
+}
+
+cmd_project() {
+  case ${1:-} in
+    add)
+      shift
+      local path="" title=""
+      while [ $# -gt 0 ]; do case $1 in
+        --title) title=$2; shift 2;;
+        -*) die "unknown flag $1";;
+        *) [ -z "$path" ] && path=$1 || die "unexpected arg: $1"; shift;;
+      esac; done
+      [ -n "$path" ] || die "usage: t3ctl project add <path> [--title T]"
+      [ -d "$path" ] || die "no such directory: $path"
+      [ -n "$title" ] || title=$(basename "$path")
+      SNAP=$(shell_snap)
+      local existing
+      existing=$(jq -c --arg r "$path" '.projects[] | select(.workspaceRoot == $r) | {id, title, workspaceRoot}' <<<"$SNAP")
+      if [ -n "$existing" ]; then jq -c '. + {created:false}' <<<"$existing"; return; fi
+      local pid; pid=$(uuid)
+      dispatch "$(jq -cn --arg pid "$pid" --arg title "$title" --arg root "$path" --arg cid "$(uuid)" --arg at "$(now)" '
+        {type:"project.create", commandId:$cid, projectId:$pid, title:$title, workspaceRoot:$root, createdAt:$at}')" >/dev/null
+      jq -cn --arg pid "$pid" --arg title "$title" --arg root "$path" '{id:$pid, title:$title, workspaceRoot:$root, created:true}';;
+    set-model)
+      local project=${2:-} sel=${3:-}
+      [ -n "$project" ] && [ -n "$sel" ] || die "usage: t3ctl project set-model <project> <instanceId>:<model>"
+      case $sel in *:*) ;; *) die "model must be instanceId:model (e.g. claudeAgent:claude-fable-5-1)";; esac
+      resolve_project "$project"
+      dispatch "$(jq -cn --arg pid "$PID" --arg i "${sel%%:*}" --arg mo "${sel#*:}" --arg cid "$(uuid)" '
+        {type:"project.meta.update", commandId:$cid, projectId:$pid,
+         defaultModelSelection:{instanceId:$i, model:$mo}}')" >/dev/null
+      jq -cn --arg pid "$PID" --arg i "${sel%%:*}" --arg mo "${sel#*:}" \
+        '{projectId:$pid, defaultModelSelection:{instanceId:$i, model:$mo}}';;
+    *) die "usage: t3ctl project add <path> [--title T] | set-model <project> <instanceId>:<model>";;
+  esac
+}
+
+cmd_contract_check() {
+  # Every internal contract this script depends on, exercised read-only, so a
+  # t3 version bump fails here instead of inside a thread. Extend when a new
+  # endpoint/field is used. Complements `selftest` (end-to-end, costs a turn).
+  local snap n tid
+  snap=$(shell_snap) || exit 1
+  jq -e '.projects | type == "array"' >/dev/null <<<"$snap" || die "shell snapshot has no .projects array (API changed?)"
+  jq -e '.threads | type == "array"' >/dev/null <<<"$snap" || die "shell snapshot has no .threads array (API changed?)"
+  n=$(jq -r '.projects | length' <<<"$snap")
+  if [ "$n" -gt 0 ]; then
+    jq -e '.projects[0] | has("id") and has("title") and has("workspaceRoot")' >/dev/null <<<"$snap" || die "project shape changed"
+  fi
+  tid=$(jq -r '.threads[0].id // empty' <<<"$snap")
+  if [ -n "$tid" ]; then
+    api GET "/api/orchestration/threads/$tid?turnLimit=1" | jq -e '.thread | has("messages") and has("activities")' >/dev/null \
+      || die "thread detail shape changed"
+  fi
+  local db_checked=false
+  if command -v sqlite3 >/dev/null && [ -r "$DB" ]; then
+    sqlite3 -readonly "$DB" "SELECT 1 FROM projection_thread_messages, projection_threads, projection_projects, projection_turns LIMIT 0;" >/dev/null 2>&1 \
+      || die "search SQL schema changed (projection_* tables) — re-extract per docs/t3-hermes-control.md §4"
+    db_checked=true
+  fi
+  jq -cn --arg base "$BASE" --argjson projects "$n" --argjson threads "$(jq '.threads|length' <<<"$snap")" \
+         --arg db "$DB" --argjson dbc "$db_checked" \
+    '{ok:true, base:$base, projects:$projects, threads:$threads, db:$db, dbSchemaChecked:$dbc}'
+}
+
+cmd_selftest() {
+  # What a human did by hand on 2026-09-08 to prove the Hermes leg works:
+  # create a tagged thread, get PONG, force the callback command, see the
+  # approver accept it unattended, delete the probe. Run after a T3_VERSION
+  # bump and on every new box. Costs one tiny model turn.
+  local project="" tid="" fail=0 t0 pong_s="" cb_s="" reason ans w
+  while [ $# -gt 0 ]; do case $1 in
+    --project) project=$2; shift 2;;
+    *) die "usage: t3ctl selftest [--project <project>]";;
+  esac; done
+  SNAP=$(shell_snap)
+  [ -n "$project" ] || project=$(jq -r '.projects[0].title // empty' <<<"$SNAP")
+  [ -n "$project" ] || die "selftest: no project on this server"
+  command -v "$NOTIFY_BIN" >/dev/null 2>&1 || die "selftest: $NOTIFY_BIN is not installed — the callback leg cannot work"
+
+  t0=$SECONDS
+  w=$(cmd_new "$project" "Connectivity self-test. Reply with exactly the word PONG and nothing else. Do not run tools, do not read or edit files." --title "selftest $(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  tid=$(jq -r .threadId <<<"$w")
+  echo "selftest: thread $tid" >&2
+  SNAP=""; w=$(cmd_watch "$tid" --timeout 120)
+  reason=$(jq -r .reason <<<"$w")
+  # Some models run the callback right after PONG (the footer asks for it on
+  # completion). That pending approval is the approver's to accept — keep
+  # watching until the turn really settles instead of calling it a failure.
+  local deadline=$((SECONDS + 150))
+  while [ "$reason" = pending-approval ] || [ "$reason" = timeout ]; do
+    [ $SECONDS -ge $deadline ] && break
+    SNAP=""; w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
+  done
+  ans=$(jq -r '.lastAssistant // ""' <<<"$w")
+  if [ "$reason" = settled ] && [[ $ans == *PONG* ]]; then pong_s=$((SECONDS - t0)); else fail=1; echo "selftest: PONG leg failed ($reason): $w" >&2; fi
+
+  # If the model already called back during the PONG leg and the approver
+  # accepted it, the callback leg is proven — do not force a second one.
+  local early_acc=0
+  if [ $fail -eq 0 ]; then
+    SNAP=""; early_acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
+  fi
+  if [ $fail -eq 0 ] && [ "$early_acc" -ge 1 ]; then
+    cb_s="0"; echo "selftest: callback already made and auto-approved during the PONG leg" >&2
+  elif [ $fail -eq 0 ]; then
+    t0=$SECONDS
+    SNAP=""; cmd_say "$tid" "Run exactly this command and nothing else: $NOTIFY_BIN --thread $tid --status done \"t3ctl selftest callback\"" >/dev/null
+    local deadline=$((SECONDS + 150))
+    while :; do
+      SNAP=""; w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
+      [ "$reason" = settled ] && break
+      # pending-approval here is expected: the approver takes up to one
+      # 15 s cycle. Anything else that is not "still running" is a failure.
+      case $reason in pending-approval|timeout) ;; *) break;; esac
+      [ $SECONDS -ge $deadline ] && break
+    done
+    if [ "$reason" = settled ] && [ "$(jq -r '.lastError // ""' <<<"$w")" = "" ]; then
+      SNAP=""; local acc; acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
+      if [ "$acc" -ge 1 ]; then cb_s=$((SECONDS - t0)); else fail=1; echo "selftest: callback settled but no accepted approval found (approver not running?)" >&2; fi
+    else
+      fail=1; echo "selftest: callback leg failed ($reason): $w" >&2
+    fi
+  fi
+
+  SNAP=""; simple_thread_cmd rm "$tid" >/dev/null || echo "selftest: could not delete probe thread $tid" >&2
+  jq -cn --arg project "$project" --arg tid "$tid" --arg pong "$pong_s" --arg cb "$cb_s" --argjson ok "$([ $fail -eq 0 ] && echo true || echo false)" \
+    '{ok:$ok, project:$project, threadId:$tid,
+      pong: (if $pong == "" then "FAILED" else ($pong + "s") end),
+      callback: (if $cb == "" then "FAILED" else ($cb + "s (approved unattended)") end),
+      deleted:true}'
+  return $fail
+}
+
 case ${1:---help} in
   projects)   shift; cmd_projects "$@";;
   models)     shift; cmd_models "$@";;
@@ -654,7 +880,10 @@ case ${1:---help} in
   approvals)  shift; cmd_approvals "$@";;
   approve)    shift; cmd_approve "$@";;
   approve-callbacks) shift; cmd_approve_callbacks "$@";;
+  token)      shift; cmd_token "$@";;
+  project)    shift; cmd_project "$@";;
   selftest)   shift; cmd_selftest "$@";;
+  contract-check) shift; cmd_contract_check "$@";;
   interrupt|stop|rm|settle|unsettle) c=$1; shift; simple_thread_cmd "$c" "$@";;
   -h|--help|help) usage;;
   *) die "unknown command '$1' (t3ctl --help)";;
