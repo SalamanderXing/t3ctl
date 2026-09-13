@@ -34,6 +34,8 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import time
 import urllib.error
@@ -90,6 +92,15 @@ def main() -> None:
     )
     ap.add_argument("message", nargs="*", help="the report (or pipe via stdin)")
     args = ap.parse_args()
+
+    relay = Path(__file__).resolve().with_name('t3-events')
+    if args.thread and relay.exists():
+        check = subprocess.run([str(relay), 'managed', '--thread', args.thread], capture_output=True, text=True)
+        if check.returncode:
+            die(f"event registry lookup failed: {check.stderr.strip()}", 3)
+        if json.loads(check.stdout)['managed']:
+            print(f"{PROG}: thread is monitored by the gateway; legacy callback suppressed")
+            return
 
     message = " ".join(args.message).strip()
     if not message and not sys.stdin.isatty():

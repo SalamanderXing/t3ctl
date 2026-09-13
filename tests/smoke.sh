@@ -11,7 +11,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 T3CTL=$ROOT/bin/t3ctl
-TMP=$(mktemp -d)
+mkdir -p "$ROOT/tmp"
+TMP=$(mktemp -d "$ROOT/tmp/smoke.XXXXXX")
 cleanup() { [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -218,3 +219,5 @@ out=$("$T3CTL" contract-check); assert_contains "$out" '"ok":true' "contract-che
 ok "project set-model + contract-check"
 
 echo "all $pass checks passed"
+
+python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py'

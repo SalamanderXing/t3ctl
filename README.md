@@ -110,3 +110,47 @@ change without notice between nightlies. `docs/COMPAT.md` records the
 (t3ctl tag, t3 version) pairs that were verified; `docs/t3-hermes-control.md`
 §4 is the procedure for re-deriving the contracts from the source map when a
 bump breaks something.
+
+## Session state events
+
+Opt-in: set `T3CTL_EVENTS_ENABLED=1` in both the gateway and t3ctl environment,
+install `bin/t3-events` beside t3ctl, and import that same file as `t3_events`
+in the Hermes gateway. Start `watch_gateway(runner)` with the gateway's
+supervised task lifecycle. The Kosmi image provides the pinned integration.
+The gateway injection method must accept `expected_session_id` and reject a
+route that changed owners before acceptance.
+
+`new`/`say` capture HERMES_SESSION_ID and HERMES_SESSION_KEY in a persistent
+SQLite subscription; the receipt says `monitoring: events` only if registration
+succeeded. Interactive messaging gateways are supported. CLI, webhook and
+api_server origins keep manual monitoring; they must not be promised an async
+return path through a messaging adapter.
+
+The relay observes typed T3 state every 15 seconds, with no model calls while
+nothing changes. Completion, errors and pending input/approval requests create
+a durable outbox event identified by dispatch + turn + state + request IDs.
+New dispatches supersede pending events from older turns. A busy parent leaves
+the event pending without consuming retry attempts. Closed or unrelated
+sessions cannot adopt results; compression continuations retain ownership.
+Delivery failures back off, stop after eight attempts, and remain visible via
+`t3-events status`. Pending events expire after 48 hours; terminal history is
+retained seven days. Registrations fail independently of the primary dispatch:
+inspect `monitoring: manual` and use the receipt's previousTurnId with watch.
+
+The outbox survives restarts. Acknowledgement is after gateway adapter
+acceptance, not after the resulting model turn finishes. A crash between
+acceptance and acknowledgement can replay an event (at-least-once delivery);
+verification and any follow-up side effects must remain idempotent.
+
+Transport: `--prompt-file path|-` accepts literal multiline text; `--execute`
+exits plan mode without changing runtime permissions. `show`/`watch` expose
+`userInputs`; `answer THREAD REQUEST --answers-file path|-` responds using the
+question IDs. `watch --after-turn PREVIOUS` never presents the previous turn
+as the newly-dispatched turn. Its full JSON input goes through stdin, so large
+responses cannot overflow the OS argument limit.
+
+Run `python3 -m unittest discover -s tests -p 'test_*.py'` and `bash tests/smoke.sh`.
+
+State-read failures back off and stop after eight consecutive failures, emitting
+`monitoring-failed` for the owner to inspect. `t3-events status` exposes retained
+event outcomes and subscription states. A new dispatch resets monitoring.

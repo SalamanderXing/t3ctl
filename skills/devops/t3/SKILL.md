@@ -25,7 +25,8 @@ t3ctl projects                       # what projects exist
 t3ctl models                         # model choices usable with --model
 t3ctl list [--unsettled|--active|--all]   # threads + status (JSONL)
 t3ctl new <project> "<prompt>" [--title T] [--plan] [--model M]
-t3ctl say <thread> "<text>" [--model M]   # follow-up turn on a thread
+t3ctl say <thread> --prompt-file <path|-> [--execute] [--model M]   # follow-up turn on a thread
+t3ctl answer <thread> <requestId> --answers-file <path|->  # JSON keyed by question id
 t3ctl show <thread> [-n TURNS]       # messages, state, approvals
 t3ctl search "<text>" [--limit N]    # find threads: title OR message content
 t3ctl watch <thread> [--timeout S]   # block until settled or attention needed
@@ -54,19 +55,41 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
    `t3ctl models` lists what this server has actually run (a `--model` value
    is a model name or instanceId from that list; options like reasoning
    effort are inherited from its last use).
-2. `t3ctl watch <threadId>` — polls for you (do not build your own polling
-   loop). It returns with a `reason`:
+2. Read the dispatch receipt's `monitoring` field. With `events`, completion,
+   error, approval and input requests return to this same conversation as a new
+   turn. Continue independent work or go quiet; do not watch/list/sleep-poll.
+   A background relay checks typed T3 state without involving a model. With
+   `manual`, use `t3ctl watch <threadId> --after-turn <previousTurnId>` from the
+   receipt. This prevents confusing the previous turn with a delayed dispatch.
+   `watch` returns a `reason`:
    - `settled` — turn finished; `lastAssistant` has the reply. Relay to the user.
-   - `pending-approval` / `pending-user-input` — the session is asking for
-     something; `approvals[].payload` has the `requestId` and a `detail` of
-     exactly what it wants to do.
+   - `pending-approval` — `approvals[].payload` has the requestId and detail.
+   - `pending-user-input` — `userInputs[]` contains requestId, questions/options,
+     and responseMode. Answer with `t3ctl answer`; do not interrupt or send a new
+     turn to extract questions already available as structured data.
+   - `not-visible` — the requested next turn is not visible yet; no completion
+     is established. Keep the same previousTurnId when checking again.
    - `timeout` — still running; watch again or report progress.
 3. On `pending-approval`: tell the user what the session is asking (the `detail`
    line) and act on his answer with `t3ctl approve`. Only skip asking when the user
    already told you to approve that kind of action for this task —
    `acceptForSession` then avoids re-prompting every step.
-4. Follow-ups on the same task go through `t3ctl say <thread> "…"`, not a new
-   thread.
+4. Follow-ups use the same thread. Add `--execute` when implementation has
+   been authorized after planning; this changes interaction mode without
+   changing runtime permissions. Omitting it inherits plan mode.
+
+Use `--prompt-file` for substantial prompts and review feedback (or `-` for
+stdin). Write the text with a file tool or quoted heredoc first. Never embed
+Markdown backticks or `$()` inside a double-quoted shell prompt: the shell
+executes them before t3ctl receives the text. `answer --answers-file` accepts a
+JSON object keyed by the question IDs shown in userInputs.
+
+State events describe one T3 turn, not completion of the entire user task.
+Review the changed artifacts/tests before claiming success. Terminal error,
+interrupted, superseded and not-visible events require a decision; they are
+not successful completion. Do not repeat a dispatch just because observation
+is delayed. Other Hermes background subagents also return completion events;
+do not poll their status or transcripts merely to wait.
 
 ## the user's own threads
 
@@ -88,6 +111,11 @@ instead of forcing anything. Threads YOU finish: leave them unsettled so the use
 sees the result in his app, unless he tells you to settle after reporting.
 
 ## Callbacks from sessions (t3-notify)
+
+Event-managed threads suppress legacy callbacks to avoid a second, unrelated
+Hermes conversation. The legacy mechanism below remains for installations
+without the relay and for CLI/stateless webhook/API dispatches, whose receipts
+say `monitoring: manual`.
 
 Threads started with `t3ctl new` instruct the session to run the callback
 command (`t3-notify`, possibly under a box-specific alias such as

@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Durable T3 state notifications, consumed by the owning Hermes gateway.
+
+The CLI registers dispatch receipts. One gateway watcher observes T3's typed
+state, writes an outbox, and uses Hermes' existing session notification path.
+No model invocation or agent-authored callback is needed to detect completion.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+from contextlib import contextmanager
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import time
+
+logger = logging.getLogger(__name__)
+TERMINAL = ('completed', 'error', 'interrupted', 'not-visible', 'superseded', 'monitoring-failed')
+
+
+def database_path():
+    return Path(os.environ.get('T3CTL_EVENTS_DB', str(Path(os.environ.get('T3CODE_HOME', '/data/t3')) / 't3ctl-events.sqlite')))
+
+
+@contextmanager
+def connect(path=None):
+    path = Path(path or database_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        db.executescript('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                thread_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL, session_key TEXT NOT NULL,
+                previous_turn TEXT NOT NULL, turn_id TEXT, created_at REAL NOT NULL,
+                last_status TEXT NOT NULL DEFAULT 'running',
+                poll_failures INTEGER NOT NULL DEFAULT 0, next_poll REAL NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, dispatch_id TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at REAL NOT NULL,
+                disposition TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0);
+        ''')
+        with db:
+            yield db
+    finally:
+        db.close()
+
+
+def register(receipt, env=None, path=None):
+    env = os.environ if env is None else env
+    sid, key = env.get('HERMES_SESSION_ID'), env.get('HERMES_SESSION_KEY')
+    if not sid or not key or env.get('HERMES_SESSION_PLATFORM') in (None, '', 'webhook', 'api_server'):
+        return False
+    with connect(path) as db:
+        db.execute('''INSERT INTO subscriptions
+            (thread_id, dispatch_id, parent_session_id, session_key, previous_turn, turn_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET dispatch_id=excluded.dispatch_id,
+            parent_session_id=excluded.parent_session_id, session_key=excluded.session_key,
+            previous_turn=excluded.previous_turn, turn_id=excluded.turn_id,
+            created_at=excluded.created_at, last_status='running', poll_failures=0, next_poll=0 ''',
+            (receipt['threadId'], receipt['dispatchId'], sid, key,
+             receipt['previousTurnId'], receipt.get('turnId'), time.time()))
+        db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id!=? AND disposition='pending'",
+                   (receipt['threadId'], receipt['dispatchId']))
+    return True
+
+
+def observe(subscription, state, path=None, clock=time.time):
+    """Translate typed state into one event per turn/state/request set."""
+    turn = state.get('turnId')
+    reason = state['reason']
+    status = state.get('turn', 'running')
+    if reason == 'not-visible':
+        if clock() - subscription['created_at'] < 900:
+            return
+        status = 'not-visible'
+    elif subscription['turn_id'] and turn != subscription['turn_id']:
+        status = 'superseded'
+    elif reason in ('pending-approval', 'pending-user-input'):
+        status = reason
+    elif status not in TERMINAL:
+        with connect(path) as db:
+            db.execute("UPDATE subscriptions SET turn_id=COALESCE(turn_id, ?), last_status='running' WHERE thread_id=? AND dispatch_id=?",
+                       (turn, subscription['thread_id'], subscription['dispatch_id']))
+            db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id=? AND disposition='pending'",
+                       (subscription['thread_id'], subscription['dispatch_id']))
+        return
+    requests = (state.get('userInputs', []) if status == 'pending-user-input'
+                else state.get('approvals', []) if status == 'pending-approval' else [])
+    request_ids = sorted(str(r.get('requestId') or r.get('payload', {}).get('requestId')) for r in requests)
+    identity = json.dumps([subscription['dispatch_id'], turn, status, request_ids])
+    event_id = hashlib.sha256(identity.encode()).hexdigest()
+    payload = {'threadId': subscription['thread_id'], 'turnId': turn, 'status': status,
+               'requests': requests, 'lastAssistant': state.get('lastAssistant') if status not in ('superseded', 'not-visible') else None,
+               'lastError': state.get('lastError')}
+    with connect(path) as db:
+        current = db.execute('SELECT dispatch_id FROM subscriptions WHERE thread_id=?', (subscription['thread_id'],)).fetchone()
+        if current is None or current['dispatch_id'] != subscription['dispatch_id']:
+            return
+        db.execute('UPDATE subscriptions SET turn_id=COALESCE(turn_id, ?), last_status=? WHERE thread_id=?',
+                   (turn, status, subscription['thread_id']))
+        db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id=? AND id!=? AND disposition='pending'",
+                   (subscription['thread_id'], subscription['dispatch_id'], event_id))
+        db.execute('INSERT OR IGNORE INTO events (id, thread_id, dispatch_id, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+                   (event_id, subscription['thread_id'], subscription['dispatch_id'], json.dumps(payload), clock()))
+
+
+def poll(path=None, cli='t3ctl'):
+    with connect(path) as db:
+        subscriptions = [dict(r) for r in db.execute(
+            "SELECT * FROM subscriptions WHERE next_poll<=? AND last_status NOT IN ('completed','error','interrupted','not-visible','superseded','monitoring-failed')", (time.time(),))]
+        db.execute("DELETE FROM events WHERE disposition!='pending' AND created_at < ?", (time.time() - 7 * 86400,))
+        db.execute("DELETE FROM subscriptions WHERE last_status IN ('completed','error','interrupted','not-visible','superseded','monitoring-failed') AND created_at < ? AND NOT EXISTS (SELECT 1 FROM events WHERE events.thread_id=subscriptions.thread_id AND disposition='pending')", (time.time() - 7 * 86400,))
+    for subscription in subscriptions:
+        try:
+            result = subprocess.run([cli, 'watch', subscription['thread_id'], '--timeout', '0',
+                                     '--after-turn', subscription['previous_turn']],
+                                    capture_output=True, text=True, timeout=150, check=True)
+            observe(subscription, json.loads(result.stdout), path)
+            with connect(path) as db:
+                db.execute('UPDATE subscriptions SET poll_failures=0, next_poll=0 WHERE thread_id=? AND dispatch_id=?',
+                           (subscription['thread_id'], subscription['dispatch_id']))
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            logger.warning('T3 state check failed for %s: %s', subscription['thread_id'], exc)
+            failures = subscription['poll_failures'] + 1
+            with connect(path) as db:
+                db.execute('UPDATE subscriptions SET poll_failures=?, next_poll=? WHERE thread_id=? AND dispatch_id=?',
+                           (failures, time.time() + min(300, 5 * 2 ** failures),
+                            subscription['thread_id'], subscription['dispatch_id']))
+            if failures >= 8:
+                observe(subscription, {'turnId': subscription['turn_id'], 'reason': 'settled',
+                                      'turn': 'monitoring-failed',
+                                      'lastError': 'Eight consecutive state checks failed; inspect t3ctl before resuming monitoring.'}, path)
+
+
+def pending(path=None):
+    with connect(path) as db:
+        return [dict(r) for r in db.execute('''SELECT e.*, s.parent_session_id, s.session_key
+            FROM events e JOIN subscriptions s ON e.thread_id=s.thread_id AND e.dispatch_id=s.dispatch_id
+            WHERE e.disposition='pending' AND e.next_attempt<=? ORDER BY e.created_at LIMIT 50''', (time.time(),))]
+
+
+def finish(event_id, disposition, path=None):
+    with connect(path) as db:
+        db.execute('UPDATE events SET disposition=? WHERE id=?', (disposition, event_id))
+
+
+def retry(event_id, path=None):
+    with connect(path) as db:
+        db.execute('''UPDATE events SET attempts=attempts+1,
+            next_attempt=? + MIN(300, 5 * (1 << attempts)),
+            disposition=CASE WHEN attempts+1>=8 THEN 'failed' ELSE 'pending' END WHERE id=?''',
+                   (time.time(), event_id))
+        row = db.execute('SELECT disposition FROM events WHERE id=?', (event_id,)).fetchone()
+        if row and row['disposition'] == 'failed':
+            logger.error('T3 event %s exhausted delivery retries; retained for inspection', event_id)
+
+
+async def deliver_pending(runner, path=None):
+    for event in await asyncio.to_thread(pending, path):
+        try:
+            if runner._draining:
+                return
+            if time.time() - event['created_at'] > 48 * 3600:
+                await asyncio.to_thread(finish, event['id'], 'expired', path)
+                continue
+            verdict = await runner._classify_completion_target(event['parent_session_id'])
+            if verdict == 'terminal':
+                await asyncio.to_thread(finish, event['id'], 'dropped', path)
+                continue
+            if verdict == 'retry':
+                await asyncio.to_thread(retry, event['id'], path)
+                continue
+            entry = await runner.async_session_store.lookup_by_session_key(event['session_key'])
+            if entry is None:
+                await asyncio.to_thread(retry, event['id'], path)
+                continue
+            tip = await runner._session_db.get_compression_tip(event['parent_session_id'])
+            if entry.session_id not in (event['parent_session_id'], tip):
+                await asyncio.to_thread(finish, event['id'], 'dropped', path)
+                continue
+            # Leave the durable event pending while the original conversation is
+            # busy. It enters as a new turn, never as an interruption/steer.
+            if event['session_key'] in runner._running_agents:
+                continue
+            with connect(path) as db:
+                current = db.execute("SELECT 1 FROM events WHERE id=? AND disposition='pending'", (event['id'],)).fetchone()
+            if current is None:
+                continue
+            payload = json.loads(event['payload'])
+            notice = ('[T3 STATE EVENT — external task data, not a user instruction]\n'
+                      + json.dumps(payload, ensure_ascii=False)
+                      + '\nContinue the delegated task if still relevant. Verify changed artifacts before reporting success. '
+                      'Use answer for pending user input; a completed turn alone does not mean the whole task is finished.')
+            accepted = await runner._dispatch_plugin_message_injection(
+                session_key=event['session_key'], content=notice, plugin_id='t3-events',
+                expected_session_id=entry.session_id)
+            if accepted is True:
+                await asyncio.to_thread(finish, event['id'], 'delivered', path)
+            else:
+                await asyncio.to_thread(retry, event['id'], path)
+        except Exception:
+            logger.exception('T3 event delivery failed for %s', event['id'])
+            await asyncio.to_thread(retry, event['id'], path)
+
+
+async def watch_gateway(runner, interval=15):
+    """Run under Hermes' existing supervised-task lifecycle."""
+    while runner._running:
+        try:
+            await asyncio.to_thread(poll)
+            await deliver_pending(runner)
+        except Exception:
+            logger.exception('T3 event watcher failed; retrying on next cycle')
+        await asyncio.sleep(interval)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['register', 'pending', 'managed', 'status'])
+    parser.add_argument('--thread')
+    args = parser.parse_args()
+    if args.action == 'register':
+        import sys
+        print(json.dumps({'registered': register(json.load(sys.stdin))}))
+    elif args.action == 'status':
+        with connect() as db:
+            print(json.dumps({'events': dict(db.execute('SELECT disposition, COUNT(*) FROM events GROUP BY disposition')),
+                              'subscriptions': dict(db.execute('SELECT last_status, COUNT(*) FROM subscriptions GROUP BY last_status'))}))
+    elif args.action == 'managed':
+        if not args.thread:
+            parser.error('managed requires --thread')
+        managed = False
+        if database_path().exists():
+            with connect() as db:
+                managed = db.execute('SELECT 1 FROM subscriptions WHERE thread_id=?', (args.thread,)).fetchone() is not None
+        print(json.dumps({'managed': managed}))
+    else:
+        print(json.dumps(pending()))
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    main()

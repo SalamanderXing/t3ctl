@@ -68,14 +68,16 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
                                           --active only running/attention,
                                           --unsettled the app's inbox
   t3ctl new <project> "<prompt>" [opts]   create thread + start first turn
-        [--title T] [--plan] [--model M] [--mode M | --full-access]
+        [--title T] [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access]
   t3ctl say <thread> "<text>" [opts]      start a turn on an existing thread
-        [--plan] [--model M] [--mode M | --full-access | --inherit]
+        [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access | --inherit]
   t3ctl show <thread> [-n TURNS]          messages, turn state, approvals
   t3ctl search "<text>" [--limit N]       find threads by title or message
                                           content (case-insensitive substring)
-  t3ctl watch <thread> [--timeout S]      poll until the turn settles or an
+  t3ctl watch <thread> [--timeout S] [--after-turn ID]      poll until the turn settles or an
                                           approval is pending; prints outcome
+  t3ctl answer <thread> <requestId> --answers-file path|-
+                                          answer a pending question (JSON object)
   t3ctl settle <thread>                   mark done (leave the app's inbox)
   t3ctl unsettle <thread>                 put back into the app's inbox
   t3ctl approvals <thread>                pending/answered approval requests
@@ -193,8 +195,8 @@ api() { # api METHOD PATH [JSON_BODY]
   local method=$1 path=$2 body=${3:-} out code resp tok
   tok=$(token) || exit 1
   local args=(-sS -m 60 -X "$method" -H "Authorization: Bearer $tok" -w $'\n%{http_code}')
-  [ -n "$body" ] && args+=(-H "Content-Type: application/json" --data "$body")
-  out=$(curl "${args[@]}" "$BASE$path") || die "cannot reach t3 at $BASE — is the t3 server up? (a full disk presents exactly like this: check df -h)"
+  [ -n "$body" ] && args+=(-H "Content-Type: application/json" --data-binary @-)
+  out=$(printf '%s' "$body" | curl "${args[@]}" "$BASE$path") || die "cannot reach t3 at $BASE — is the t3 server up? (a full disk presents exactly like this: check df -h)"
   code=${out##*$'\n'}
   resp=${out%$'\n'*}
   if { [ "$code" = 401 ] || [ "$code" = 403 ]; } && [ "$TOKEN_MODE" = self ] && [ "${_T3CTL_RETRIED:-0}" = 0 ]; then
@@ -288,29 +290,28 @@ require_ours_or_force() { # $1: force flag (true/false)
     die "thread '$(jq -r .title <<<"$THREAD")' was not created by t3ctl ($TAG prefix); this is somebody else's session — pass --force only when explicitly asked to kill it"
 }
 
-wait_turn_visible() { # $1 threadId  $2 previous turnId (or "none") → echoes state
+wait_turn_visible() { # $1 threadId  $2 previous turnId (or "none") → echoes turnId + state
   # Dispatch is async event-sourcing: the receipt returns before the turn
   # reaches the read model. Block here so a follow-up `t3ctl watch` cannot
   # mistake the previous turn's "completed" for this turn having settled.
-  local tid=$1 old=$2 i cur state=none
+  local tid=$1 old=$2 i cur
   for i in 1 2 3 4 5 6 7 8; do
     cur=$(shell_snap | jq -r --arg id "$tid" \
       '.threads[] | select(.id == $id) | [.latestTurn.turnId // "none", .latestTurn.state // "none"] | join(" ")')
-    state=${cur#* }
-    [ "${cur%% *}" != "$old" ] && { echo "$state"; return 0; }
+    [ "${cur%% *}" != "$old" ] && { echo "$cur"; return 0; }
     sleep 2
   done
   # Still the previous turn after ~16 s: say so instead of handing back the
   # old turn's state, which a follow-up `watch` would misread as settled.
-  echo "not-visible"
+  echo "none not-visible"
 }
 
 turn_json() { # $1 threadId  $2 text  $3 mode  $4 interactionMode  [$5 modelSelection]
-  jq -cn --arg tid "$1" --arg text "$2" --arg mode "$3" --arg imode "$4" \
+  printf '%s' "$2" | jq -Rsc --arg tid "$1" --arg mode "$3" --arg imode "$4" \
         --argjson msel "${5:-null}" \
         --arg cid "$(uuid)" --arg mid "$(uuid)" --arg at "$(now)" '
     {type:"thread.turn.start", commandId:$cid, threadId:$tid,
-     message:{messageId:$mid, role:"user", text:$text, attachments:[]},
+     message:{messageId:$mid, role:"user", text:., attachments:[]},
      runtimeMode:$mode, interactionMode:$imode, createdAt:$at}
     + (if $msel == null then {} else {modelSelection: $msel} end)'
 }
@@ -361,12 +362,27 @@ cmd_list() {
     | sort_by(.updatedAt) | reverse | .[]'
 }
 
+register_events() {
+  local receipt result monitoring=manual
+  receipt=$(cat)
+  if [ "${T3CTL_EVENTS_ENABLED:-0}" = 1 ]; then
+    if result=$(printf '%s' "$receipt" | T3CODE_HOME="$T3_HOME" T3CTL_EVENTS_DB="${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}" "$(dirname "${BASH_SOURCE[0]}")/t3-events" register); then
+      [ "$(jq -r .registered <<<"$result")" = true ] && monitoring=events
+    else
+      echo "t3ctl: event registration failed; task was dispatched, use watch with previousTurnId" >&2
+    fi
+  fi
+  jq -c --arg monitoring "$monitoring" '. + {monitoring:$monitoring}' <<<"$receipt"
+}
+
 cmd_new() {
-  local project="" prompt="" title="" mode=$DEFAULT_MODE imode=default explicit="" model=""
+  local project="" prompt="" prompt_file="" title="" mode=$DEFAULT_MODE imode=default explicit="" model=""
   [ "$mode" = full-access ] && explicit=explicit   # deployment default, already gated above
   while [ $# -gt 0 ]; do case $1 in
     --title) title=$2; shift 2;;
     --plan) imode=plan; shift;;
+    --execute) imode=default; shift;;
+    --prompt-file) [ -n "${2:-}" ] || die "--prompt-file requires a path or -"; prompt_file=$2; shift 2;;
     --model) model=$2; shift 2;;
     --mode) check_mode "$2"
             if [ -n "$MODE_FIXED" ] && [ "$2" != "$DEFAULT_MODE" ]; then
@@ -377,6 +393,11 @@ cmd_new() {
     -*) die "unknown flag $1";;
     *) if [ -z "$project" ]; then project=$1; elif [ -z "$prompt" ]; then prompt=$1; else die "unexpected arg: $1"; fi; shift;;
   esac; done
+  if [ -n "$prompt_file" ]; then
+    [ -z "$prompt" ] || die "use either prompt text or --prompt-file"
+    prompt=$(cat -- "$prompt_file" && printf .) || die "cannot read prompt file"
+    prompt=${prompt%.}
+  fi
   [ -n "$project" ] && [ -n "$prompt" ] || die "usage: t3ctl new <project> \"<prompt>\""
   [ "$mode" = full-access ] && [ -z "$explicit" ] && die "full-access needs --full-access"
 
@@ -404,7 +425,11 @@ cmd_new() {
   local tid; tid=$(uuid)
   # Callback + scheduling contract for the agent inside the session. The
   # thread id is only known here, so t3ctl injects it rather than the skill.
-  if command -v "$NOTIFY_CMD" >/dev/null 2>&1; then
+  if [ "${T3CTL_EVENTS_ENABLED:-0}" = 1 ] && [ -n "${HERMES_SESSION_ID:-}" ] && [ -n "${HERMES_SESSION_KEY:-}" ] && [ "${HERMES_SESSION_PLATFORM:-}" != webhook ] && [ "${HERMES_SESSION_PLATFORM:-}" != api_server ]; then
+    prompt="$prompt
+
+T3 state changes are monitored by the gateway and returned to the dispatching conversation. Do not call $NOTIFY_CMD or create polling/scheduling jobs."
+  elif command -v "$NOTIFY_CMD" >/dev/null 2>&1; then
     prompt="$prompt
 
 ---
@@ -420,20 +445,24 @@ Run it as a plain command exactly in that form (double-quoted summary, no other 
      title:$title, modelSelection:$msel, runtimeMode:$mode,
      interactionMode:$imode, branch:null, worktreePath:null, createdAt:$at}')
   dispatch "$create" >/dev/null
-  dispatch "$(turn_json "$tid" "$prompt" "$mode" "$imode")" >/dev/null
-  local state; state=$(wait_turn_visible "$tid" none)
+  local command; command=$(turn_json "$tid" "$prompt" "$mode" "$imode")
+  dispatch "$command" >/dev/null || return 1
+  local visible state turn_id; visible=$(wait_turn_visible "$tid" none)
+  turn_id=${visible%% *}; state=${visible#* }
   jq -cn --arg id "$tid" --arg title "$title" --arg mode "$mode" \
-         --arg state "$state" --argjson msel "$msel" \
-    '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state}'
+         --arg state "$state" --arg turn_id "$turn_id" --arg dispatch_id "$(jq -r .commandId <<<"$command")" --argjson msel "$msel" \
+    '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:"none", dispatchId:$dispatch_id}' | register_events
 }
 
 cmd_say() {
   # Continuing a thread inherits ITS runtime mode by default: owned threads
   # were created approval-required, and other people's threads keep whatever
   # they chose — a follow-up must not quietly downgrade (or upgrade) a session.
-  local thread="" text="" mode="" imode="" explicit="" model="" msel=null
+  local thread="" text="" prompt_file="" mode="" imode="" explicit="" model="" msel=null
   while [ $# -gt 0 ]; do case $1 in
     --plan) imode=plan; shift;;
+    --execute) imode=default; shift;;
+    --prompt-file) [ -n "${2:-}" ] || die "--prompt-file requires a path or -"; prompt_file=$2; shift 2;;
     --model) model=$2; shift 2;;
     --mode) check_mode "$2"; mode=$2; shift 2;;
     --full-access) [ "$ALLOW_FULL" = 1 ] || die "full-access is disabled on this deployment (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL)"; mode=full-access; explicit=explicit; shift;;
@@ -441,16 +470,54 @@ cmd_say() {
     -*) die "unknown flag $1";;
     *) if [ -z "$thread" ]; then thread=$1; elif [ -z "$text" ]; then text=$1; else die "unexpected arg: $1"; fi; shift;;
   esac; done
+  if [ -n "$prompt_file" ]; then
+    [ -z "$text" ] || die "use either prompt text or --prompt-file"
+    text=$(cat -- "$prompt_file" && printf .) || die "cannot read prompt file"
+    text=${text%.}
+  fi
   [ -n "$thread" ] && [ -n "$text" ] || die "usage: t3ctl say <thread> \"<text>\""
   resolve_thread "$thread"
   [ -n "$mode" ] || mode=$(jq -r '.runtimeMode' <<<"$THREAD")
   [ -n "$imode" ] || imode=$(jq -r '.interactionMode // "default"' <<<"$THREAD")
   [ -z "$model" ] || msel=$(resolve_model "$model")
   local old; old=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
-  dispatch "$(turn_json "$TID" "$text" "$mode" "$imode" "$msel")" >/dev/null
-  local state; state=$(wait_turn_visible "$TID" "$old")
-  jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" \
-    '{threadId:$id, mode:$mode, turn:$state}'
+  local command; command=$(turn_json "$TID" "$text" "$mode" "$imode" "$msel")
+  dispatch "$command" >/dev/null || return 1
+  local visible state turn_id; visible=$(wait_turn_visible "$TID" "$old")
+  turn_id=${visible%% *}; state=${visible#* }
+  jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --arg turn_id "$turn_id" --arg old "$old" --arg dispatch_id "$(jq -r .commandId <<<"$command")" \
+    '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:$old, dispatchId:$dispatch_id}' | register_events
+}
+
+INPUT_FILTER='
+  def pending_approvals:
+    . as $thread | reduce (.activities[]?) as $a ({};
+      if $a.tone == "approval" and ($a.turnId == null or $a.turnId == $thread.latestTurn.turnId)
+      then if $a.kind == "approval.resolved" or $a.payload.decision != null
+           then del(.[$a.payload.requestId])
+           else .[$a.payload.requestId] = {summary:$a.summary, createdAt:$a.createdAt, payload:$a.payload} end
+      else . end) | [.[]];
+  def user_inputs:
+    . as $thread | reduce (.activities[]?) as $a ({};
+      if $a.kind == "user-input.requested" and
+         ($a.turnId == null or $a.turnId == $thread.latestTurn.turnId)
+      then .[$a.payload.requestId] = $a.payload
+      elif $a.kind == "user-input.resolved" then del(.[$a.payload.requestId])
+      else . end) | [.[]];
+'
+
+cmd_answer() {
+  [ "$#" -eq 4 ] && [ "$3" = --answers-file ] || die "usage: t3ctl answer <thread> <requestId> --answers-file <path|->"
+  local thread=$1 request=$2 answers command
+  answers=$(cat -- "$4") || die "cannot read answers file"
+  jq -e 'type == "object"' >/dev/null <<<"$answers" || die "answers must be a JSON object keyed by question id"
+  resolve_thread "$thread"
+  api GET "/api/orchestration/threads/$TID?turnLimit=1" |
+    jq -e --arg request "$request" "$INPUT_FILTER"'.thread | user_inputs | any(.requestId == $request)' >/dev/null ||
+    die "request is not pending on this thread"
+  command=$(printf '%s' "$answers" | jq -c --arg tid "$TID" --arg rid "$request" --arg cid "$(uuid)" --arg at "$(now)" '
+    {type:"thread.user-input.respond", commandId:$cid, threadId:$tid, requestId:$rid, answers:., createdAt:$at}')
+  dispatch "$command"
 }
 
 cmd_show() {
@@ -462,10 +529,11 @@ cmd_show() {
   esac; done
   [ -n "$thread" ] || die "usage: t3ctl show <thread> [-n turns]"
   resolve_thread "$thread"
-  api GET "/api/orchestration/threads/$TID?turnLimit=$turns" | jq --argjson cap "$TEXT_CAP" '
+  api GET "/api/orchestration/threads/$TID?turnLimit=$turns" | jq --argjson cap "$TEXT_CAP" "$INPUT_FILTER"'
     .thread | {id, title, mode: .runtimeMode, interaction: .interactionMode,
       session: {status: (.session.status // "none"), lastError: (.session.lastError // null)},
       latestTurn,
+      userInputs: user_inputs,
       approvals: [.activities[] | select(.tone == "approval")
                   | {summary, turnId, createdAt, payload}],
       messages: [.messages[] | {role, createdAt,
@@ -647,8 +715,9 @@ cmd_approve_callbacks() {
 }
 
 cmd_watch() {
-  local thread="" timeout=900 interval=5
+  local thread="" timeout=900 interval=5 after_turn=""
   while [ $# -gt 0 ]; do case $1 in
+    --after-turn) [ -n "${2:-}" ] || die "--after-turn requires a turn id"; after_turn=$2; shift 2;;
     --timeout) num --timeout "${2:-}"; timeout=$2; shift 2;;
     --interval) num --interval "${2:-}"; interval=$2; shift 2;;
     -*) die "unknown flag $1";;
@@ -660,6 +729,11 @@ cmd_watch() {
   while :; do
     t=$(shell_snap | jq -c --arg id "$TID" '.threads[] | select(.id == $id)')
     [ -n "$t" ] || die "thread $TID disappeared"
+    if [ -n "$after_turn" ] && [ "$(jq -r '.latestTurn.turnId // "none"' <<<"$t")" = "$after_turn" ]; then
+      [ $SECONDS -ge $deadline ] && { reason=not-visible; break; }
+      sleep "$interval"
+      continue
+    fi
     if jq -e '.hasPendingApprovals' >/dev/null <<<"$t"; then reason=pending-approval; break; fi
     if jq -e '.hasPendingUserInput' >/dev/null <<<"$t"; then reason=pending-user-input; break; fi
     state=$(jq -r '.latestTurn.state // "none"' <<<"$t")
@@ -674,17 +748,18 @@ cmd_watch() {
     sleep "$interval"
   done
   local detail; detail=$(api GET "/api/orchestration/threads/$TID?turnLimit=1")
-  jq -n --arg reason "$reason" --argjson t "$t" --argjson d "$detail" --argjson cap "$TEXT_CAP" '
-    {reason: $reason,
+  printf '%s\n%s\n' "$t" "$detail" | jq -s --arg reason "$reason" --argjson cap "$TEXT_CAP" "$INPUT_FILTER"'
+    .[0] as $t | .[1] as $d |
+    {turnId: $t.latestTurn.turnId, userInputs: ($d.thread | user_inputs), reason: $reason,
      turn: ($t.latestTurn.state // "none"),
      lastError: ($t.session.lastError // null),
      approvals: (if $reason == "pending-approval" or $reason == "pending-user-input"
-                 then [$d.thread.activities[] | select(.tone == "approval") | {summary, createdAt, payload}]
+                 then ($d.thread | pending_approvals)
                  else [] end),
-     lastAssistant: ([$d.thread.messages[] | select(.role == "assistant")] | last
+     lastAssistant: (if $reason == "not-visible" then null else ([$d.thread.messages[] | select(.role == "assistant")] | last
                      | if . == null then null
                        elif (.text|length) > $cap then (.text[:$cap] + "…[truncated]")
-                       else .text end)}'
+                       else .text end) end)}'
 }
 
 simple_thread_cmd() { # $1: interrupt|stop|rm, then thread + flags
@@ -875,6 +950,7 @@ case ${1:---help} in
   new)        shift; cmd_new "$@";;
   say)        shift; cmd_say "$@";;
   show)       shift; cmd_show "$@";;
+  answer)     shift; cmd_answer "$@";;
   search)     shift; cmd_search "$@";;
   watch)      shift; cmd_watch "$@";;
   approvals)  shift; cmd_approvals "$@";;
