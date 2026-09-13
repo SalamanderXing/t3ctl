@@ -94,6 +94,16 @@ class EventsTest(unittest.TestCase):
         events.register({**self.receipt, 'dispatchId': 'next', 'turnId': 'next-turn'}, self.env, self.db)
         self.assertEqual(events.pending(self.db), [])
 
+    def test_new_dispatch_during_delivery_cannot_resurrect_superseded_event(self):
+        self.observe()
+        async def replace_dispatch(**kwargs):
+            events.register({**self.receipt, 'dispatchId': 'next'}, self.env, self.db)
+            return False
+        self.runner._dispatch_plugin_message_injection.side_effect = replace_dispatch
+        asyncio.run(events.deliver_pending(self.runner, self.db))
+        with events.connect(self.db) as db:
+            self.assertEqual(db.execute('SELECT disposition FROM events').fetchone()[0], 'superseded')
+
     def test_resolved_question_does_not_arrive_after_completion(self):
         self.observe(reason='pending-user-input', turn='running', userInputs=[{'requestId': 'question', 'questions': []}])
         self.observe(reason='timeout', turn='running')

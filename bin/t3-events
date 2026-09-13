@@ -150,14 +150,14 @@ def pending(path=None):
 
 def finish(event_id, disposition, path=None):
     with connect(path) as db:
-        db.execute('UPDATE events SET disposition=? WHERE id=?', (disposition, event_id))
+        db.execute("UPDATE events SET disposition=? WHERE id=? AND disposition='pending'", (disposition, event_id))
 
 
 def retry(event_id, path=None):
     with connect(path) as db:
         db.execute('''UPDATE events SET attempts=attempts+1,
             next_attempt=? + MIN(300, 5 * (1 << attempts)),
-            disposition=CASE WHEN attempts+1>=8 THEN 'failed' ELSE 'pending' END WHERE id=?''',
+            disposition=CASE WHEN attempts+1>=8 THEN 'failed' ELSE 'pending' END WHERE id=? AND disposition='pending' ''',
                    (time.time(), event_id))
         row = db.execute('SELECT disposition FROM events WHERE id=?', (event_id,)).fetchone()
         if row and row['disposition'] == 'failed':

@@ -111,6 +111,14 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('legacy callback suppressed', result.stdout)
 
+    def test_outbox_failure_does_not_repeat_or_veto_primary_dispatch(self):
+        self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(self.path / 'token' / 'events.sqlite'),
+                         'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route',
+                         'HERMES_SESSION_PLATFORM': 'discord'})
+        out = self.cli('say', 'test-thread', 'Continue')
+        self.assertEqual(out['monitoring'], 'manual')
+        self.assertEqual(len(self.server.state.dispatched), 1)
+
     def test_invalid_inputs_cannot_dispatch(self):
         self.cli('say', 'test-thread', 'text', '--prompt-file', '-', text='other', success=False)
         self.cli('answer', 'test-thread', 'input-1', '--answers-file', '-', text='[]', success=False)
