@@ -135,7 +135,7 @@ sessions cannot adopt results; compression continuations retain ownership.
 Delivery failures back off, stop after eight attempts, and remain visible via
 `t3-events status`. Pending events expire after 48 hours; terminal history is
 retained seven days. Registrations fail independently of the primary dispatch:
-inspect `monitoring: manual` and use the receipt's previousTurnId with watch.
+inspect `monitoring: manual` and use the receipt's messageId with `watch --message-id`.
 
 The outbox survives restarts. Acknowledgement is after gateway adapter
 acceptance, not after the resulting model turn finishes. A crash between
@@ -154,3 +154,11 @@ Run `python3 -m unittest discover -s tests -p 'test_*.py'` and `bash tests/smoke
 State-read failures back off and stop after eight consecutive failures, emitting
 `monitoring-failed` for the owner to inspect. `t3-events status` exposes retained
 event outcomes and subscription states. A new dispatch resets monitoring.
+
+Turn ownership is resolved from T3's read-only `projection_turns` mapping
+(`pending_message_id` → `turn_id`), never from whichever turn happens to appear
+next. Receipts include the dispatched message ID; `watch --message-id ID` waits
+for that mapping or reports supersession without unrelated output. `contract-check`
+validates these source columns. Successful unmanaged dispatches release the old
+subscription, and callback suppression checks the actual current turn so desktop
+takeovers also retain the legacy notification path.

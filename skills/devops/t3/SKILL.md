@@ -59,7 +59,7 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
    error, approval and input requests return to this same conversation as a new
    turn. Continue independent work or go quiet; do not watch/list/sleep-poll.
    A background relay checks typed T3 state without involving a model. With
-   `manual`, use `t3ctl watch <threadId> --after-turn <previousTurnId>` from the
+   `manual`, use `t3ctl watch <threadId> --message-id <messageId>` from the
    receipt. This prevents confusing the previous turn with a delayed dispatch.
    `watch` returns a `reason`:
    - `settled` — turn finished; `lastAssistant` has the reply. Relay to the user.
@@ -68,7 +68,7 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
      and responseMode. Answer with `t3ctl answer`; do not interrupt or send a new
      turn to extract questions already available as structured data.
    - `not-visible` — the requested next turn is not visible yet; no completion
-     is established. Keep the same previousTurnId when checking again.
+     is established. Keep the same messageId when checking again.
    - `timeout` — still running; watch again or report progress.
 3. On `pending-approval`: tell the user what the session is asking (the `detail`
    line) and act on his answer with `t3ctl approve`. Only skip asking when the user

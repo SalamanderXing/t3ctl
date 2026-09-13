@@ -3,6 +3,7 @@ import asyncio
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = SourceFileLoader('t3_events_test', str(ROOT / 'bin/t3-events'))
+loader = SourceFileLoader('t3_events_test', os.environ.get('T3_EVENTS_TEST_BIN', str(ROOT / 'bin/t3-events')))
 spec = spec_from_loader(loader.name, loader)
 events = module_from_spec(spec)
 loader.exec_module(events)
@@ -22,8 +23,8 @@ class EventsTest(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(dir=ROOT / 'tmp')
         self.addCleanup(temp.cleanup)
         self.db = Path(temp.name) / 'events.sqlite'
-        self.receipt = {'threadId': 'thread', 'dispatchId': 'dispatch', 'previousTurnId': 'old', 'turnId': 'turn'}
-        self.env = {'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route', 'HERMES_SESSION_PLATFORM': 'discord'}
+        self.receipt = {'threadId': 'thread', 'dispatchId': 'dispatch', 'messageId': 'message', 'previousTurnId': 'old', 'turnId': 'turn'}
+        self.env = {'T3CTL_EVENTS_ENABLED': '1', 'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route', 'HERMES_SESSION_PLATFORM': 'discord'}
         self.assertTrue(events.register(self.receipt, self.env, self.db))
         self.runner = SimpleNamespace(
             _draining=False, _running_agents={},
@@ -112,6 +113,7 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(json.loads(events.pending(self.db)[0]['payload'])['status'], 'completed')
 
     def test_foreign_turn_is_not_reported_as_our_completion(self):
+        self.observe(reason='timeout', turn='running')
         self.observe(turnId='someone-elses-turn', lastAssistant='Foreign output')
         self.assertEqual(json.loads(events.pending(self.db)[0]['payload'])['status'], 'superseded')
 
@@ -124,6 +126,14 @@ class EventsTest(unittest.TestCase):
             events.poll(self.db)
         self.assertEqual(run.call_count, 8)
         self.assertEqual(json.loads(events.pending(self.db)[0]['payload'])['status'], 'monitoring-failed')
+
+    def test_manual_takeover_clears_old_subscription_and_pending_delivery(self):
+        self.observe()
+        self.assertFalse(events.register({**self.receipt, 'dispatchId': 'manual'}, {}, self.db))
+        self.assertEqual(events.pending(self.db), [])
+        self.assertFalse(events.managed('thread', self.db))
+        with events.connect(self.db) as db:
+            self.assertEqual(db.execute('SELECT disposition FROM events').fetchone()[0], 'superseded')
 
     def test_webhook_cannot_register_callback_loop(self):
         self.assertFalse(events.register(self.receipt, {**self.env, 'HERMES_SESSION_PLATFORM': 'webhook'}, self.db))

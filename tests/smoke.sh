@@ -78,9 +78,9 @@ ln -s "$ROOT/bin/t3-notify" "$TMP/bin/t3-notify"
 # search SQL schema stand-in (empty tables with the columns the query touches)
 sqlite3 "$TMP/t3home/userdata/state.sqlite" <<'SQL'
 CREATE TABLE projection_projects(project_id TEXT, deleted_at TEXT);
-CREATE TABLE projection_threads(thread_id TEXT, project_id TEXT, deleted_at TEXT, archived_at TEXT, updated_at TEXT);
+CREATE TABLE projection_threads(thread_id TEXT, project_id TEXT, deleted_at TEXT, archived_at TEXT, updated_at TEXT, latest_turn_id TEXT);
 CREATE TABLE projection_thread_messages(thread_id TEXT, message_id TEXT, role TEXT, text TEXT, created_at TEXT, is_streaming INTEGER);
-CREATE TABLE projection_turns(assistant_message_id TEXT);
+CREATE TABLE projection_turns(assistant_message_id TEXT, thread_id TEXT, turn_id TEXT, pending_message_id TEXT);
 SQL
 
 python3 "$ROOT/tests/fake_t3_server.py" --port "$PORT" --tokens-file "$TOKENS" --state "$STATE" --seed "$TMP/seed.json" &

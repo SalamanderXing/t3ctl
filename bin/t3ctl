@@ -74,7 +74,7 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
   t3ctl show <thread> [-n TURNS]          messages, turn state, approvals
   t3ctl search "<text>" [--limit N]       find threads by title or message
                                           content (case-insensitive substring)
-  t3ctl watch <thread> [--timeout S] [--after-turn ID]      poll until the turn settles or an
+  t3ctl watch <thread> [--message-id ID] [--timeout S] [--after-turn ID]      poll until the turn settles or an
                                           approval is pending; prints outcome
   t3ctl answer <thread> <requestId> --answers-file path|-
                                           answer a pending question (JSON object)
@@ -365,11 +365,11 @@ cmd_list() {
 register_events() {
   local receipt result monitoring=manual
   receipt=$(cat)
-  if [ "${T3CTL_EVENTS_ENABLED:-0}" = 1 ]; then
-    if result=$(printf '%s' "$receipt" | T3CODE_HOME="$T3_HOME" T3CTL_EVENTS_DB="${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}" "$(dirname "${BASH_SOURCE[0]}")/t3-events" register); then
+  if [ -x "$(dirname "${BASH_SOURCE[0]}")/t3-events" ]; then
+    if result=$(printf '%s' "$receipt" | T3CTL_EVENTS_ENABLED="${T3CTL_EVENTS_ENABLED:-0}" T3CODE_HOME="$T3_HOME" T3CTL_EVENTS_DB="${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}" "$(dirname "${BASH_SOURCE[0]}")/t3-events" register); then
       [ "$(jq -r .registered <<<"$result")" = true ] && monitoring=events
     else
-      echo "t3ctl: event registration failed; task was dispatched, use watch with previousTurnId" >&2
+      echo "t3ctl: event registration failed; task was dispatched, use watch with messageId" >&2
     fi
   fi
   jq -c --arg monitoring "$monitoring" '. + {monitoring:$monitoring}' <<<"$receipt"
@@ -450,8 +450,8 @@ Run it as a plain command exactly in that form (double-quoted summary, no other 
   local visible state turn_id; visible=$(wait_turn_visible "$tid" none)
   turn_id=${visible%% *}; state=${visible#* }
   jq -cn --arg id "$tid" --arg title "$title" --arg mode "$mode" \
-         --arg state "$state" --arg turn_id "$turn_id" --arg dispatch_id "$(jq -r .commandId <<<"$command")" --argjson msel "$msel" \
-    '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:"none", dispatchId:$dispatch_id}' | register_events
+         --arg state "$state" --arg turn_id "$turn_id" --arg message_id "$(jq -r .message.messageId <<<"$command")" --arg dispatch_id "$(jq -r .commandId <<<"$command")" --argjson msel "$msel" \
+    '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:"none", dispatchId:$dispatch_id, messageId:$message_id}' | register_events
 }
 
 cmd_say() {
@@ -485,8 +485,8 @@ cmd_say() {
   dispatch "$command" >/dev/null || return 1
   local visible state turn_id; visible=$(wait_turn_visible "$TID" "$old")
   turn_id=${visible%% *}; state=${visible#* }
-  jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --arg turn_id "$turn_id" --arg old "$old" --arg dispatch_id "$(jq -r .commandId <<<"$command")" \
-    '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:$old, dispatchId:$dispatch_id}' | register_events
+  jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --arg turn_id "$turn_id" --arg old "$old" --arg message_id "$(jq -r .message.messageId <<<"$command")" --arg dispatch_id "$(jq -r .commandId <<<"$command")" \
+    '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:$old, dispatchId:$dispatch_id, messageId:$message_id}' | register_events
 }
 
 INPUT_FILTER='
@@ -715,20 +715,32 @@ cmd_approve_callbacks() {
 }
 
 cmd_watch() {
-  local thread="" timeout=900 interval=5 after_turn=""
+  local thread="" timeout=900 interval=5 after_turn="" message_id="" expected_turn=""
   while [ $# -gt 0 ]; do case $1 in
+    --message-id) [ -n "${2:-}" ] || die "--message-id requires a message id"; message_id=$2; shift 2;;
     --after-turn) [ -n "${2:-}" ] || die "--after-turn requires a turn id"; after_turn=$2; shift 2;;
     --timeout) num --timeout "${2:-}"; timeout=$2; shift 2;;
     --interval) num --interval "${2:-}"; interval=$2; shift 2;;
     -*) die "unknown flag $1";;
     *) [ -z "$thread" ] && thread=$1 || die "unexpected arg: $1"; shift;;
   esac; done
-  [ -n "$thread" ] || die "usage: t3ctl watch <thread> [--timeout s]"
+  [ -n "$thread" ] || die "usage: t3ctl watch <thread> [--message-id ID] [--timeout s]"
   resolve_thread "$thread"
   local deadline=$((SECONDS + timeout)) grace=$((SECONDS + 60)) reason="" t state
   while :; do
+    if [ -n "$message_id" ]; then
+      expected_turn=$(T3CTL_DB="$DB" "$(dirname "${BASH_SOURCE[0]}")/t3-events" turn --thread "$TID" --message "$message_id" | jq -r '.turnId // "none"') || return 1
+    fi
     t=$(shell_snap | jq -c --arg id "$TID" '.threads[] | select(.id == $id)')
     [ -n "$t" ] || die "thread $TID disappeared"
+    if [ -n "$message_id" ]; then
+      if [ "$expected_turn" = none ]; then
+        [ $SECONDS -ge $deadline ] && { reason=not-visible; break; }
+        sleep "$interval"
+        continue
+      fi
+      [ "$(jq -r '.latestTurn.turnId // "none"' <<<"$t")" = "$expected_turn" ] || { reason=superseded; break; }
+    fi
     if [ -n "$after_turn" ] && [ "$(jq -r '.latestTurn.turnId // "none"' <<<"$t")" = "$after_turn" ]; then
       [ $SECONDS -ge $deadline ] && { reason=not-visible; break; }
       sleep "$interval"
@@ -748,15 +760,16 @@ cmd_watch() {
     sleep "$interval"
   done
   local detail; detail=$(api GET "/api/orchestration/threads/$TID?turnLimit=1")
+  if [ "$reason" != not-visible ] && [ "$(jq -r '.latestTurn.turnId' <<<"$t")" != "$(jq -r '.thread.latestTurn.turnId' <<<"$detail")" ]; then reason=superseded; fi
   printf '%s\n%s\n' "$t" "$detail" | jq -s --arg reason "$reason" --argjson cap "$TEXT_CAP" "$INPUT_FILTER"'
     .[0] as $t | .[1] as $d |
-    {turnId: $t.latestTurn.turnId, userInputs: ($d.thread | user_inputs), reason: $reason,
-     turn: ($t.latestTurn.state // "none"),
+    {turnId: $t.latestTurn.turnId, userInputs: (if $reason == "not-visible" or $reason == "superseded" then [] else ($d.thread | user_inputs) end), reason: $reason,
+     turn: (if $reason == "superseded" then "superseded" else ($t.latestTurn.state // "none") end),
      lastError: ($t.session.lastError // null),
      approvals: (if $reason == "pending-approval" or $reason == "pending-user-input"
                  then ($d.thread | pending_approvals)
                  else [] end),
-     lastAssistant: (if $reason == "not-visible" then null else ([$d.thread.messages[] | select(.role == "assistant")] | last
+     lastAssistant: (if $reason == "not-visible" or $reason == "superseded" then null else ([$d.thread.messages[] | select(.role == "assistant")] | last
                      | if . == null then null
                        elif (.text|length) > $cap then (.text[:$cap] + "…[truncated]")
                        else .text end) end)}'
@@ -865,8 +878,8 @@ cmd_contract_check() {
   fi
   local db_checked=false
   if command -v sqlite3 >/dev/null && [ -r "$DB" ]; then
-    sqlite3 -readonly "$DB" "SELECT 1 FROM projection_thread_messages, projection_threads, projection_projects, projection_turns LIMIT 0;" >/dev/null 2>&1 \
-      || die "search SQL schema changed (projection_* tables) — re-extract per docs/t3-hermes-control.md §4"
+    sqlite3 -readonly "$DB" "SELECT projection_threads.latest_turn_id, projection_turns.thread_id, projection_turns.turn_id, projection_turns.pending_message_id FROM projection_thread_messages, projection_threads, projection_projects, projection_turns LIMIT 0;" >/dev/null 2>&1 \
+      || die "search/turn-correlation SQL schema changed (projection_* tables) — re-extract per docs/t3-hermes-control.md §4"
     db_checked=true
   fi
   jq -cn --arg base "$BASE" --argjson projects "$n" --argjson threads "$(jq '.threads|length' <<<"$snap")" \

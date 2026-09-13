@@ -2,10 +2,14 @@
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+
+from test_events import events
 
 from fake_t3_server import Handler, Server, State
 
@@ -36,7 +40,21 @@ class TransportTest(unittest.TestCase):
         worker.start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
-        self.env = {**os.environ, 'T3CTL_CONF': '/dev/null', 'T3CTL_TOKEN_MODE': 'file',
+        self.source_db = self.path / 't3.sqlite'
+        with sqlite3.connect(self.source_db) as db:
+            db.executescript('CREATE TABLE projection_turns (thread_id TEXT, turn_id TEXT, pending_message_id TEXT); CREATE TABLE projection_threads (thread_id TEXT, latest_turn_id TEXT);')
+            db.execute('INSERT INTO projection_threads VALUES (?,?)', ('test-thread', 'old'))
+        dispatch = self.server.state.dispatch
+        def dispatch_and_project(command):
+            result = dispatch(command)
+            if command['type'] == 'thread.turn.start':
+                turn = self.thread['latestTurn']['turnId']
+                with sqlite3.connect(self.source_db) as db:
+                    db.execute('INSERT INTO projection_turns VALUES (?,?,?)', ('test-thread', turn, command['message']['messageId']))
+                    db.execute('UPDATE projection_threads SET latest_turn_id=?', (turn,))
+            return result
+        self.server.state.dispatch = dispatch_and_project
+        self.env = {**os.environ, 'T3CTL_DB': str(self.source_db), 'T3CTL_CONF': '/dev/null', 'T3CTL_TOKEN_MODE': 'file',
                     'T3CTL_TOKEN_FILE': str(token), 'T3CTL_TAG': '[test]',
                     'T3CTL_URL': f'http://127.0.0.1:{self.server.server_port}',
                     'T3CTL_DENY_ORIGINS': '', 'T3CTL_TEXT_CAP': '3000'}
@@ -49,6 +67,11 @@ class TransportTest(unittest.TestCase):
             return json.loads(result.stdout)
         self.assertNotEqual(result.returncode, 0)
         return result
+
+    def managed(self):
+        result = subprocess.run([str(Path(CLI).parent / 't3-events'), 'managed', '--thread', 'test-thread'],
+                                env=self.env, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)['managed']
 
     def request(self, rid='input-1'):
         return {'kind': 'user-input.requested', 'tone': 'info', 'turnId': 'old',
@@ -110,6 +133,54 @@ class TransportTest(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('legacy callback suppressed', result.stdout)
+
+    def test_delayed_dispatch_cannot_adopt_foreign_output(self):
+        outbox = self.path / 'events.sqlite'
+        self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(outbox),
+                         'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route',
+                         'HERMES_SESSION_PLATFORM': 'discord'})
+        receipt = {'threadId': 'test-thread', 'dispatchId': 'dispatch', 'messageId': 'delayed-message',
+                   'previousTurnId': 'old', 'turnId': None}
+        self.assertTrue(events.register(receipt, self.env, outbox))
+        self.thread['latestTurn'] = {'turnId': 'foreign', 'state': 'completed'}
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'FOREIGN OUTPUT'}]
+        with patch.dict(os.environ, self.env, clear=True):
+            events.poll(outbox, CLI)
+        self.assertEqual(events.pending(outbox), [])
+        with sqlite3.connect(self.source_db) as db:
+            db.execute('INSERT INTO projection_turns VALUES (?,?,?)', ('test-thread', 'owned', 'delayed-message'))
+        with patch.dict(os.environ, self.env, clear=True):
+            events.poll(outbox, CLI)
+        payload = json.loads(events.pending(outbox)[0]['payload'])
+        self.assertEqual(payload['status'], 'superseded')
+        self.assertIsNone(payload['lastAssistant'])
+
+    def test_message_correlation_can_resolve_a_delayed_owned_turn(self):
+        self.thread['latestTurn'] = {'turnId': 'owned', 'state': 'completed'}
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'OWNED OUTPUT'}]
+        with sqlite3.connect(self.source_db) as db:
+            db.execute('INSERT INTO projection_turns VALUES (?,?,?)', ('test-thread', 'owned', 'message'))
+        out = self.cli('watch', 'test-thread', '--message-id', 'message', '--timeout', '0')
+        self.assertEqual(out['lastAssistant'], 'OWNED OUTPUT')
+        self.assertEqual(out['turnId'], 'owned')
+
+    def test_manual_or_desktop_takeover_restores_legacy_callback(self):
+        outbox = self.path / 'events.sqlite'
+        self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(outbox),
+                         'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route',
+                         'HERMES_SESSION_PLATFORM': 'discord'})
+        self.cli('say', 'test-thread', 'Managed work')
+        self.assertTrue(self.managed())
+        self.env['T3CTL_EVENTS_ENABLED'] = '0'
+        self.assertFalse(self.managed())
+        self.env['T3CTL_EVENTS_ENABLED'] = '1'
+        with sqlite3.connect(self.source_db) as db:
+            db.execute('UPDATE projection_threads SET latest_turn_id=?', ('desktop-turn',))
+        self.assertFalse(self.managed())
+        self.env['T3CTL_EVENTS_ENABLED'] = '0'
+        out = self.cli('say', 'test-thread', 'Manual work')
+        self.assertEqual(out['monitoring'], 'manual')
+        self.assertFalse(self.managed())
 
     def test_outbox_failure_does_not_repeat_or_veto_primary_dispatch(self):
         self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(self.path / 'token' / 'events.sqlite'),

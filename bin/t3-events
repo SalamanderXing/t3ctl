@@ -38,7 +38,7 @@ def connect(path=None):
             CREATE TABLE IF NOT EXISTS subscriptions (
                 thread_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL,
                 parent_session_id TEXT NOT NULL, session_key TEXT NOT NULL,
-                previous_turn TEXT NOT NULL, turn_id TEXT, created_at REAL NOT NULL,
+                previous_turn TEXT NOT NULL, message_id TEXT NOT NULL, turn_id TEXT, created_at REAL NOT NULL,
                 last_status TEXT NOT NULL DEFAULT 'running',
                 poll_failures INTEGER NOT NULL DEFAULT 0, next_poll REAL NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS events (
@@ -56,18 +56,23 @@ def connect(path=None):
 def register(receipt, env=None, path=None):
     env = os.environ if env is None else env
     sid, key = env.get('HERMES_SESSION_ID'), env.get('HERMES_SESSION_KEY')
-    if not sid or not key or env.get('HERMES_SESSION_PLATFORM') in (None, '', 'webhook', 'api_server'):
+    if env.get('T3CTL_EVENTS_ENABLED') != '1' or not sid or not key or env.get('HERMES_SESSION_PLATFORM') in (None, '', 'webhook', 'api_server'):
+        # Successful manual dispatch transfers ownership away from the gateway.
+        if Path(path or database_path()).exists():
+            with connect(path) as db:
+                db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND disposition='pending'", (receipt['threadId'],))
+                db.execute('DELETE FROM subscriptions WHERE thread_id=?', (receipt['threadId'],))
         return False
     with connect(path) as db:
         db.execute('''INSERT INTO subscriptions
-            (thread_id, dispatch_id, parent_session_id, session_key, previous_turn, turn_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (thread_id, dispatch_id, parent_session_id, session_key, previous_turn, message_id, turn_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_id) DO UPDATE SET dispatch_id=excluded.dispatch_id,
             parent_session_id=excluded.parent_session_id, session_key=excluded.session_key,
-            previous_turn=excluded.previous_turn, turn_id=excluded.turn_id,
+            previous_turn=excluded.previous_turn, message_id=excluded.message_id, turn_id=excluded.turn_id,
             created_at=excluded.created_at, last_status='running', poll_failures=0, next_poll=0 ''',
             (receipt['threadId'], receipt['dispatchId'], sid, key,
-             receipt['previousTurnId'], receipt.get('turnId'), time.time()))
+             receipt['previousTurnId'], receipt['messageId'], None, time.time()))
         db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id!=? AND disposition='pending'",
                    (receipt['threadId'], receipt['dispatchId']))
     return True
@@ -113,6 +118,40 @@ def observe(subscription, state, path=None, clock=time.time):
                    (event_id, subscription['thread_id'], subscription['dispatch_id'], json.dumps(payload), clock()))
 
 
+@contextmanager
+def t3_database(path=None):
+    path = Path(path or os.environ.get('T3CTL_DB', str(Path(os.environ.get('T3CODE_HOME', '/data/t3')) / 'userdata/state.sqlite')))
+    db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def dispatch_turn(thread_id, message_id, source_path=None):
+    """Read T3's authoritative request-message → provider-turn mapping."""
+    with t3_database(source_path) as db:
+        rows = db.execute('SELECT turn_id FROM projection_turns WHERE thread_id=? AND pending_message_id=? AND turn_id IS NOT NULL',
+                          (thread_id, message_id)).fetchall()
+        if len(rows) > 1:
+            raise ValueError('Dispatch maps to multiple turns; refusing ambiguous ownership')
+        return rows[0][0] if rows else None
+
+
+def managed(thread_id, path=None, source_path=None):
+    if os.environ.get('T3CTL_EVENTS_ENABLED') == '0' or not Path(path or database_path()).exists():
+        return False
+    with connect(path) as db:
+        row = db.execute('SELECT message_id FROM subscriptions WHERE thread_id=?', (thread_id,)).fetchone()
+    if row is None:
+        return False
+    # A turn started through the desktop can also take over without registration.
+    with t3_database(source_path) as db:
+        return db.execute('''SELECT 1 FROM projection_threads AS thread JOIN projection_turns AS turn
+            ON thread.thread_id=turn.thread_id AND thread.latest_turn_id=turn.turn_id
+            WHERE thread.thread_id=? AND turn.pending_message_id=?''', (thread_id, row['message_id'])).fetchone() is not None
+
+
 def poll(path=None, cli='t3ctl'):
     with connect(path) as db:
         subscriptions = [dict(r) for r in db.execute(
@@ -122,7 +161,7 @@ def poll(path=None, cli='t3ctl'):
     for subscription in subscriptions:
         try:
             result = subprocess.run([cli, 'watch', subscription['thread_id'], '--timeout', '0',
-                                     '--after-turn', subscription['previous_turn']],
+                                     '--after-turn', subscription['previous_turn'], '--message-id', subscription['message_id']],
                                     capture_output=True, text=True, timeout=150, check=True)
             observe(subscription, json.loads(result.stdout), path)
             with connect(path) as db:
@@ -225,8 +264,9 @@ async def watch_gateway(runner, interval=15):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['register', 'pending', 'managed', 'status'])
+    parser.add_argument('action', choices=['register', 'pending', 'managed', 'status', 'turn'])
     parser.add_argument('--thread')
+    parser.add_argument('--message')
     args = parser.parse_args()
     if args.action == 'register':
         import sys
@@ -235,14 +275,14 @@ def main():
         with connect() as db:
             print(json.dumps({'events': dict(db.execute('SELECT disposition, COUNT(*) FROM events GROUP BY disposition')),
                               'subscriptions': dict(db.execute('SELECT last_status, COUNT(*) FROM subscriptions GROUP BY last_status'))}))
+    elif args.action == 'turn':
+        if not args.thread or not args.message:
+            parser.error('turn requires --thread and --message')
+        print(json.dumps({'turnId': dispatch_turn(args.thread, args.message)}))
     elif args.action == 'managed':
         if not args.thread:
             parser.error('managed requires --thread')
-        managed = False
-        if database_path().exists():
-            with connect() as db:
-                managed = db.execute('SELECT 1 FROM subscriptions WHERE thread_id=?', (args.thread,)).fetchone() is not None
-        print(json.dumps({'managed': managed}))
+        print(json.dumps({'managed': managed(args.thread)}))
     else:
         print(json.dumps(pending()))
 
