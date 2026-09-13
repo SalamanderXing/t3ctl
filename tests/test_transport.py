@@ -182,6 +182,31 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(out['monitoring'], 'manual')
         self.assertFalse(self.managed())
 
+    def test_ownership_lookup_failure_still_delivers_legacy_callback(self):
+        received = []
+        class CallbackHandler(Handler):
+            def do_POST(self):
+                received.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+                self._json(200, {'status': 'ok'})
+        gateway = Server(('127.0.0.1', 0), CallbackHandler)
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        self.addCleanup(gateway.server_close)
+        self.addCleanup(gateway.shutdown)
+        secret = self.path / 'notify-secret'
+        secret.write_text('test-only-secret')
+        self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(self.path / 'events.sqlite'),
+                         'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route',
+                         'HERMES_SESSION_PLATFORM': 'discord', 'T3_NOTIFY_SECRET_FILE': str(secret),
+                         'T3_NOTIFY_URL': f'http://127.0.0.1:{gateway.server_port}/callback'})
+        self.cli('say', 'test-thread', 'Managed work')
+        self.source_db.unlink()
+        result = subprocess.run([str(Path(CLI).parent / 't3-notify'), '--thread', 'test-thread', '--status', 'done', 'Verified output'],
+                                env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]['message'], 'Verified output')
+        self.assertIn('sending legacy callback', result.stderr)
+
     def test_outbox_failure_does_not_repeat_or_veto_primary_dispatch(self):
         self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(self.path / 'token' / 'events.sqlite'),
                          'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route',

@@ -254,11 +254,9 @@ async def deliver_pending(runner, path=None):
 async def watch_gateway(runner, interval=15):
     """Run under Hermes' existing supervised-task lifecycle."""
     while runner._running:
-        try:
-            await asyncio.to_thread(poll)
-            await deliver_pending(runner)
-        except Exception:
-            logger.exception('T3 event watcher failed; retrying on next cycle')
+        # Infrastructure failures reach Hermes' existing bounded supervisor.
+        await asyncio.to_thread(poll)
+        await deliver_pending(runner)
         await asyncio.sleep(interval)
 
 

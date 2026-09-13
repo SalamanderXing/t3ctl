@@ -95,12 +95,14 @@ def main() -> None:
 
     relay = Path(__file__).resolve().with_name('t3-events')
     if args.thread and relay.exists():
-        check = subprocess.run([str(relay), 'managed', '--thread', args.thread], capture_output=True, text=True)
-        if check.returncode:
-            die(f"event registry lookup failed: {check.stderr.strip()}", 3)
-        if json.loads(check.stdout)['managed']:
-            print(f"{PROG}: thread is monitored by the gateway; legacy callback suppressed")
-            return
+        try:
+            check = subprocess.run([str(relay), 'managed', '--thread', args.thread], capture_output=True,
+                                   text=True, timeout=10, check=True)
+            if json.loads(check.stdout)['managed'] is True:
+                print(f"{PROG}: thread is monitored by the gateway; legacy callback suppressed")
+                return
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+            print(f"{PROG}: duplicate-suppression lookup failed; sending legacy callback: {exc}", file=sys.stderr)
 
     message = " ".join(args.message).strip()
     if not message and not sys.stdin.isatty():

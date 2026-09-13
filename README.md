@@ -162,3 +162,11 @@ for that mapping or reports supersession without unrelated output. `contract-che
 validates these source columns. Successful unmanaged dispatches release the old
 subscription, and callback suppression checks the actual current turn so desktop
 takeovers also retain the legacy notification path.
+
+If the duplicate-suppression lookup fails, `t3-notify` logs the failure and still
+sends its legacy callback. Outbox/infrastructure failures propagate to Hermes'
+existing bounded task supervisor (five rapid restarts, with logged counts and a
+terminal give-up message); they do not start a second unbounded retry loop.
+After that budget is exhausted, repair the storage problem and restart the
+gateway to resume pending delivery. Inspect gateway logs for supervisor health;
+`t3-events status` reports outbox records and cannot read an unavailable database.
