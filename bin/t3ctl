@@ -362,11 +362,17 @@ cmd_list() {
     | sort_by(.updatedAt) | reverse | .[]'
 }
 
+# t3-events with this box's event settings (sourced from the conf, so not
+# exported): whether a session gets events is decided there, in one place.
+t3_events() {
+  T3CTL_EVENTS_ENABLED="${T3CTL_EVENTS_ENABLED:-0}" T3CTL_EVENTS_ORIGINS="${T3CTL_EVENTS_ORIGINS:-}" T3CODE_HOME="$T3_HOME" T3CTL_EVENTS_DB="${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}" "$(dirname "${BASH_SOURCE[0]}")/t3-events" "$@"
+}
+
 register_events() {
   local receipt result monitoring=manual
   receipt=$(cat)
   if [ -x "$(dirname "${BASH_SOURCE[0]}")/t3-events" ]; then
-    if result=$(printf '%s' "$receipt" | T3CTL_EVENTS_ENABLED="${T3CTL_EVENTS_ENABLED:-0}" T3CODE_HOME="$T3_HOME" T3CTL_EVENTS_DB="${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}" "$(dirname "${BASH_SOURCE[0]}")/t3-events" register); then
+    if result=$(printf '%s' "$receipt" | t3_events register); then
       [ "$(jq -r .registered <<<"$result")" = true ] && monitoring=events
     else
       echo "t3ctl: event registration failed; task was dispatched, use watch with messageId" >&2
@@ -425,7 +431,7 @@ cmd_new() {
   local tid; tid=$(uuid)
   # Callback + scheduling contract for the agent inside the session. The
   # thread id is only known here, so t3ctl injects it rather than the skill.
-  if [ "${T3CTL_EVENTS_ENABLED:-0}" = 1 ] && [ -n "${HERMES_SESSION_ID:-}" ] && [ -n "${HERMES_SESSION_KEY:-}" ] && [ "${HERMES_SESSION_PLATFORM:-}" != webhook ] && [ "${HERMES_SESSION_PLATFORM:-}" != api_server ]; then
+  if [ -x "$(dirname "${BASH_SOURCE[0]}")/t3-events" ] && t3_events eligible; then
     prompt="$prompt
 
 T3 state changes are monitored by the gateway and returned to the dispatching conversation. Do not call $NOTIFY_CMD or create polling/scheduling jobs."

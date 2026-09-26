@@ -124,7 +124,11 @@ route that changed owners before acceptance.
 SQLite subscription; the receipt says `monitoring: events` only if registration
 succeeded. Interactive messaging gateways are supported. CLI, webhook and
 api_server origins keep manual monitoring; they must not be promised an async
-return path through a messaging adapter.
+return path through a messaging adapter. The exception is a webhook/api_server
+lane whose sessions persist across turns and whose adapter accepts injected
+turns: list its chat-id prefixes in `T3CTL_EVENTS_ORIGINS` (comma-separated,
+e.g. `webhook:linear-comment:thread-`). `t3-events eligible` is the single
+decision both `new`'s prompt footer and registration use.
 
 The relay observes typed T3 state every 15 seconds, with no model calls while
 nothing changes. Completion, errors and pending input/approval requests create
