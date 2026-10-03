@@ -14,6 +14,8 @@ bin/t3-token-renew        mints a 30 d bearer token as the t3 user, probes it, s
                           it in root-only, revokes the predecessor; alerts on failure
 bin/t3-notify             a session's callback to the agent: signed POST to the hermes
                           webhook platform (route t3-callback)
+bin/t3-rpc                one Effect-RPC call over t3's /ws WebSocket (stdlib Python);
+                          t3ctl sends every command through it
 units/                    t3-token-renew.timer (weekly), t3-callback-approver.service
 skills/devops/t3/         the agent-facing Hermes skill
 install.sh                idempotent installer (run as root on the box)
@@ -99,14 +101,21 @@ stays the end-to-end probe). `tests/smoke.sh` exercises all of this against
   session's own `t3-notify` run is a command approval; without
   `t3-callback-approver` an unattended thread can never say "done". The
   approver accepts only that exact command, only in tagged threads.
-- **`search` rides t3's SQLite schema** (the HTTP API has no message search);
-  it is the first thing to break on a version bump. `selftest` does not cover
-  it — run `t3ctl search <word>` by hand after a bump.
+- **Commands go over the WebSocket.** t3 0.0.46 (orchestration V2) removed
+  the HTTP dispatch route; reads stay HTTP GETs but need the
+  `x-t3-orchestration-protocol: 2` header. `bin/t3-rpc` speaks just enough
+  WebSocket + Effect-RPC for one request/response, so t3ctl needs no new
+  dependencies. t3ctl ≥ v0.3.0 needs t3 ≥ 0.0.46; older t3 needs v0.2.0.
+- **V2's read model is normalised to the old output.** Runs, runtime requests
+  and turn items are folded into the `latestTurn`/`approvals[].payload`/
+  `userInputs` shapes the skill already reads, so agents see no change. An
+  approval's `detail` is the exact command (from the `command_execution` item
+  with the same native tool id), never the model's description of it.
 
 ## Coupling to T3
 
-t3ctl speaks t3's *internal* orchestration API and reads its SQLite. Both
-change without notice between nightlies. `docs/COMPAT.md` records the
+t3ctl speaks t3's *internal* orchestration API (and `t3-events` reads its
+SQLite). Both change without notice between nightlies. `docs/COMPAT.md` records the
 (t3ctl tag, t3 version) pairs that were verified; `docs/t3-hermes-control.md`
 §4 is the procedure for re-deriving the contracts from the source map when a
 bump breaks something.
@@ -155,9 +164,10 @@ State-read failures back off and stop after eight consecutive failures, emitting
 `monitoring-failed` for the owner to inspect. `t3-events status` exposes retained
 event outcomes and subscription states. A new dispatch resets monitoring.
 
-Turn ownership is resolved from T3's read-only `projection_turns` mapping
-(`pending_message_id` → `turn_id`), never from whichever turn happens to appear
-next. Receipts include the dispatched message ID; `watch --message-id ID` waits
+Turn ownership is resolved from the dispatched message: every V2 run records
+the `userMessageId` that started it (`orchestration_v2_projection_runs` for
+`t3-events`, the thread snapshot's `runs` for `watch`), never from whichever
+turn happens to appear next. Receipts include the dispatched message ID; `watch --message-id ID` waits
 for that mapping or reports supersession without unrelated output. `contract-check`
 validates these source columns. Successful unmanaged dispatches release the old
 subscription, and callback suppression checks the actual current turn so desktop

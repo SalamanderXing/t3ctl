@@ -55,9 +55,11 @@ sid=$(jq -r '.sessionId // empty' <<<"$out")
 
 # Probe the new token before swapping it in — never replace a working token
 # with a broken one.
-curl -sSf -m 30 -H "Authorization: Bearer $tok" \
-  "$BASE/api/orchestration/snapshot" -o /dev/null \
-  || fail "new token failed its snapshot probe (t3 down, or API changed after a T3_VERSION bump)"
+# (/api/orchestration/snapshot is gone in V2 and its path now falls through
+# to the web app with a 200, so it proved nothing; the shell route is real.)
+curl -sSf -m 30 -H "Authorization: Bearer $tok" -H "x-t3-orchestration-protocol: 2" \
+  "$BASE/api/orchestration/shell" -o /dev/null \
+  || fail "new token failed its shell probe (t3 down, or API changed after a T3_VERSION bump)"
 
 old_sid=$(cat "$SESSION_FILE" 2>/dev/null || true)
 umask 077

@@ -29,9 +29,8 @@ class TransportTest(unittest.TestCase):
             'id': 'test-thread', 'title': '[test] task', 'projectId': 'project',
             'runtimeMode': 'approval-required', 'interactionMode': 'plan',
             'modelSelection': {'instanceId': 'codex', 'model': 'test'},
-            'latestTurn': {'turnId': 'old', 'state': 'completed'},
-            'session': {'status': 'ready', 'lastError': None},
-            'activities': [], 'messages': [], 'hasPendingUserInput': False,
+            'runs': [{'id': 'old', 'status': 'completed', 'userMessageId': 'old-message'}],
+            'messages': [], 'requests': [],
         }
         self.server = Server(('127.0.0.1', 0), Handler)
         self.server.tokens_file = token
@@ -40,24 +39,27 @@ class TransportTest(unittest.TestCase):
         worker.start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
-        self.source_db = self.path / 't3.sqlite'
+        self.source_db = self.path / 'statev2.sqlite'
         with sqlite3.connect(self.source_db) as db:
-            db.executescript('CREATE TABLE projection_turns (thread_id TEXT, turn_id TEXT, pending_message_id TEXT); CREATE TABLE projection_threads (thread_id TEXT, latest_turn_id TEXT);')
-            db.execute('INSERT INTO projection_threads VALUES (?,?)', ('test-thread', 'old'))
+            db.execute('CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, thread_id TEXT, ordinal INTEGER, payload_json TEXT)')
+        self.project_run('old', 'old-message')
         dispatch = self.server.state.dispatch
         def dispatch_and_project(command):
             result = dispatch(command)
-            if command['type'] == 'thread.turn.start':
-                turn = self.thread['latestTurn']['turnId']
-                with sqlite3.connect(self.source_db) as db:
-                    db.execute('INSERT INTO projection_turns VALUES (?,?,?)', ('test-thread', turn, command['message']['messageId']))
-                    db.execute('UPDATE projection_threads SET latest_turn_id=?', (turn,))
+            if command['type'] == 'message.dispatch':
+                self.project_run(self.thread['runs'][-1]['id'], command['messageId'])
             return result
         self.server.state.dispatch = dispatch_and_project
         self.env = {**os.environ, 'T3CTL_DB': str(self.source_db), 'T3CTL_CONF': '/dev/null', 'T3CTL_TOKEN_MODE': 'file',
                     'T3CTL_TOKEN_FILE': str(token), 'T3CTL_TAG': '[test]',
                     'T3CTL_URL': f'http://127.0.0.1:{self.server.server_port}',
                     'T3CTL_DENY_ORIGINS': '', 'T3CTL_TEXT_CAP': '3000'}
+
+    def project_run(self, run_id, message_id):
+        with sqlite3.connect(self.source_db) as db:
+            ordinal = db.execute('SELECT COALESCE(MAX(ordinal), 0) + 1 FROM orchestration_v2_projection_runs').fetchone()[0]
+            db.execute('INSERT INTO orchestration_v2_projection_runs VALUES (?,?,?,?)',
+                       (run_id, 'test-thread', ordinal, json.dumps({'id': run_id, 'userMessageId': message_id})))
 
     def cli(self, *args, text=None, success=True):
         result = subprocess.run(['bash', CLI, *args], input=text, text=True,
@@ -73,14 +75,14 @@ class TransportTest(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True, check=True)
         return json.loads(result.stdout)['managed']
 
-    def request(self, rid='input-1'):
-        return {'kind': 'user-input.requested', 'tone': 'info', 'turnId': 'old',
-                'payload': {'requestId': rid, 'questions': [
-                    {'id': 'storage', 'header': 'Storage', 'question': 'Where?',
-                     'options': [{'label': 'Existing database', 'description': 'Reuse it'}]}]}}
+    QUESTIONS = [{'id': 'storage', 'header': 'Storage', 'question': 'Where?',
+                  'options': [{'label': 'Existing database', 'description': 'Reuse it'}]}]
+
+    def request(self, rid='input-1', status='pending'):
+        return {'id': rid, 'kind': 'user_input', 'status': status, 'runId': 'old', 'questions': self.QUESTIONS}
 
     def test_large_watch_response(self):
-        self.thread['messages'] = [{'role': 'assistant', 'text': 'result ' * 50000}]
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'result ' * 50000, 'runId': 'old'}]
         out = self.cli('watch', 'test-thread', '--timeout', '0')
         self.assertEqual(out['reason'], 'settled')
         self.assertLess(len(out['lastAssistant']), 3100)
@@ -88,37 +90,38 @@ class TransportTest(unittest.TestCase):
     def test_literal_large_prompt_from_stdin(self):
         prompt = 'Keep `bodyData`, $(false), "quotes", \\slashes\n' * 5000
         out = self.cli('say', 'test-thread', '--prompt-file', '-', text=prompt)
-        self.assertEqual(self.server.state.dispatched[-1]['message']['text'], prompt)
+        self.assertEqual(self.server.state.dispatched[-1]['text'], prompt)
         self.assertEqual(out['previousTurnId'], 'old')
-        self.assertEqual(out['turnId'], self.thread['latestTurn']['turnId'])
+        self.assertEqual(out['turnId'], self.thread['runs'][-1]['id'])
 
     def test_execute_exits_plan_without_changing_permissions(self):
         self.cli('say', 'test-thread', 'Implement', '--execute')
-        cmd = self.server.state.dispatched[-1]
-        self.assertEqual(cmd['interactionMode'], 'default')
-        self.assertEqual(cmd['runtimeMode'], 'approval-required')
+        types = [c['type'] for c in self.server.state.dispatched]
+        # V2 messages carry no modes: plan → default is its own command, the
+        # runtime mode is left alone.
+        self.assertEqual(types, ['thread.interaction-mode.set', 'message.dispatch'])
+        self.assertEqual(self.server.state.dispatched[0]['interactionMode'], 'default')
+        self.assertEqual(self.thread['runtimeMode'], 'approval-required')
 
     def test_questions_visible_and_resolved_requests_excluded(self):
-        self.thread['hasPendingUserInput'] = True
-        self.thread['activities'] = [self.request('resolved'),
-            {'kind': 'user-input.resolved', 'payload': {'requestId': 'resolved'}}, self.request()]
+        self.thread['requests'] = [self.request('resolved', 'resolved'), self.request()]
         out = self.cli('watch', 'test-thread', '--timeout', '0')
         self.assertEqual(out['reason'], 'pending-user-input')
-        self.assertEqual(out['userInputs'], [self.request()['payload']])
+        self.assertEqual(out['userInputs'], [{'requestId': 'input-1', 'questions': self.QUESTIONS}])
         self.assertEqual(self.cli('show', 'test-thread')['userInputs'], out['userInputs'])
 
     def test_answer_uses_pending_request(self):
-        self.thread['activities'] = [self.request()]
+        self.thread['requests'] = [self.request()]
         answers = {'storage': 'Existing database'}
         self.cli('answer', 'test-thread', 'input-1', '--answers-file', '-', text=json.dumps(answers))
         cmd = self.server.state.dispatched[-1]
-        self.assertEqual(cmd['type'], 'thread.user-input.respond')
+        self.assertEqual(cmd['type'], 'runtime-request.respond')
         self.assertEqual(cmd['answers'], answers)
         self.cli('answer', 'test-thread', 'unknown', '--answers-file', '-', text='{}', success=False)
         self.assertEqual(len(self.server.state.dispatched), 1)
 
     def test_old_completion_is_not_new_completion(self):
-        self.thread['messages'] = [{'role': 'assistant', 'text': 'OLD RESULT'}]
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'OLD RESULT', 'runId': 'old'}]
         out = self.cli('watch', 'test-thread', '--after-turn', 'old', '--timeout', '0')
         self.assertEqual(out['reason'], 'not-visible')
         self.assertIsNone(out['lastAssistant'])
@@ -142,13 +145,13 @@ class TransportTest(unittest.TestCase):
         receipt = {'threadId': 'test-thread', 'dispatchId': 'dispatch', 'messageId': 'delayed-message',
                    'previousTurnId': 'old', 'turnId': None}
         self.assertTrue(events.register(receipt, self.env, outbox))
-        self.thread['latestTurn'] = {'turnId': 'foreign', 'state': 'completed'}
-        self.thread['messages'] = [{'role': 'assistant', 'text': 'FOREIGN OUTPUT'}]
+        self.thread['runs'].append({'id': 'foreign', 'status': 'completed', 'userMessageId': 'other'})
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'FOREIGN OUTPUT', 'runId': 'foreign'}]
         with patch.dict(os.environ, self.env, clear=True):
             events.poll(outbox, CLI)
         self.assertEqual(events.pending(outbox), [])
-        with sqlite3.connect(self.source_db) as db:
-            db.execute('INSERT INTO projection_turns VALUES (?,?,?)', ('test-thread', 'owned', 'delayed-message'))
+        # our message's run appears, but a later run already took the thread over
+        self.thread['runs'].insert(-1, {'id': 'owned', 'status': 'completed', 'userMessageId': 'delayed-message'})
         with patch.dict(os.environ, self.env, clear=True):
             events.poll(outbox, CLI)
         payload = json.loads(events.pending(outbox)[0]['payload'])
@@ -156,10 +159,8 @@ class TransportTest(unittest.TestCase):
         self.assertIsNone(payload['lastAssistant'])
 
     def test_message_correlation_can_resolve_a_delayed_owned_turn(self):
-        self.thread['latestTurn'] = {'turnId': 'owned', 'state': 'completed'}
-        self.thread['messages'] = [{'role': 'assistant', 'text': 'OWNED OUTPUT'}]
-        with sqlite3.connect(self.source_db) as db:
-            db.execute('INSERT INTO projection_turns VALUES (?,?,?)', ('test-thread', 'owned', 'message'))
+        self.thread['runs'].append({'id': 'owned', 'status': 'completed', 'userMessageId': 'message'})
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'OWNED OUTPUT', 'runId': 'owned'}]
         out = self.cli('watch', 'test-thread', '--message-id', 'message', '--timeout', '0')
         self.assertEqual(out['lastAssistant'], 'OWNED OUTPUT')
         self.assertEqual(out['turnId'], 'owned')
@@ -174,8 +175,7 @@ class TransportTest(unittest.TestCase):
         self.env['T3CTL_EVENTS_ENABLED'] = '0'
         self.assertFalse(self.managed())
         self.env['T3CTL_EVENTS_ENABLED'] = '1'
-        with sqlite3.connect(self.source_db) as db:
-            db.execute('UPDATE projection_threads SET latest_turn_id=?', ('desktop-turn',))
+        self.project_run('desktop-run', 'desktop-message')   # a newer run started from the app
         self.assertFalse(self.managed())
         self.env['T3CTL_EVENTS_ENABLED'] = '0'
         out = self.cli('say', 'test-thread', 'Manual work')

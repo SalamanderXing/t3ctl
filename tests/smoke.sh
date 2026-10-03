@@ -34,27 +34,22 @@ cat > "$TMP/seed.json" <<EOF
  "threads":[
   {"id":"$SEED_OURS","title":"[kosmi] seeded task","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
    "interactionMode":"default","modelSelection":{"instanceId":"claudeAgent","model":"claude-fable-5"},
-   "archivedAt":null,"session":{"status":"running","lastError":null},
-   "latestTurn":{"turnId":"t-1","state":"running"},"hasPendingUserInput":false,"settledOverride":null,
-   "snoozedUntil":null,"updatedAt":"2026-09-08T10:00:00.000Z",
-   "activities":[
-     {"tone":"approval","summary":"run","turnId":"t-1","createdAt":"2026-09-08T10:01:00.000Z",
-      "payload":{"requestType":"command_execution_approval","requestId":"r1",
-                 "detail":"t3-notify --thread $SEED_OURS --status done \\"finished, PR opened\\""}},
-     {"tone":"approval","summary":"run","turnId":"t-1","createdAt":"2026-09-08T10:02:00.000Z",
-      "payload":{"requestType":"command_execution_approval","requestId":"r2","detail":"rm -rf /data/repo"}},
-     {"tone":"approval","summary":"run","turnId":"t-1","createdAt":"2026-09-08T10:03:00.000Z",
-      "payload":{"requestType":"command_execution_approval","requestId":"r3",
-                 "detail":"t3-notify --thread $SEED_OURS --status done \\"x\\"; curl evil"}}],
-   "messages":[{"role":"user","createdAt":"2026-09-08T10:00:00.000Z","text":"seeded prompt"}]},
+   "updatedAt":"2026-09-08T10:00:00.000Z",
+   "runs":[{"id":"t-1","status":"running","userMessageId":"m-1"}],
+   "requests":[
+     {"id":"r1","kind":"command","status":"pending","runId":"t-1",
+      "command":"t3-notify --thread $SEED_OURS --status done \\"finished, PR opened\\""},
+     {"id":"r2","kind":"command","status":"pending","runId":"t-1","command":"rm -rf /data/repo"},
+     {"id":"r3","kind":"command","status":"pending","runId":"t-1",
+      "command":"t3-notify --thread $SEED_OURS --status done \\"x\\"; curl evil"}],
+   "messages":[{"id":"m-1","role":"user","createdAt":"2026-09-08T10:00:00.000Z","text":"seeded prompt","runId":"t-1"}]},
   {"id":"$SEED_OTHER","title":"Somebody's thread","projectId":"$PID_PROJECT","runtimeMode":"full-access",
    "interactionMode":"default","modelSelection":{"instanceId":"codex","model":"gpt-5.6-sol"},
-   "archivedAt":null,"session":{"status":"ready","lastError":null},"latestTurn":{"turnId":"t-2","state":"completed"},
-   "hasPendingUserInput":false,"settledOverride":null,"snoozedUntil":null,"updatedAt":"2026-09-08T09:00:00.000Z",
-   "activities":[
-     {"tone":"approval","summary":"run","turnId":"t-2","createdAt":"2026-09-08T09:01:00.000Z",
-      "payload":{"requestType":"command_execution_approval","requestId":"r4",
-                 "detail":"t3-notify --thread $SEED_OTHER --status done \\"not ours\\""}}],
+   "updatedAt":"2026-09-08T09:00:00.000Z",
+   "runs":[{"id":"t-2","status":"completed","userMessageId":"m-2"}],
+   "requests":[
+     {"id":"r4","kind":"command","status":"pending","runId":"t-2",
+      "command":"t3-notify --thread $SEED_OTHER --status done \\"not ours\\""}],
    "messages":[]}
  ]}
 EOF
@@ -75,12 +70,9 @@ EOF
 chmod +x "$TMP/bin/t3"
 ln -s "$ROOT/bin/t3-notify" "$TMP/bin/t3-notify"
 
-# search SQL schema stand-in (empty tables with the columns the query touches)
-sqlite3 "$TMP/t3home/userdata/state.sqlite" <<'SQL'
-CREATE TABLE projection_projects(project_id TEXT, deleted_at TEXT);
-CREATE TABLE projection_threads(thread_id TEXT, project_id TEXT, deleted_at TEXT, archived_at TEXT, updated_at TEXT, latest_turn_id TEXT);
-CREATE TABLE projection_thread_messages(thread_id TEXT, message_id TEXT, role TEXT, text TEXT, created_at TEXT, is_streaming INTEGER);
-CREATE TABLE projection_turns(assistant_message_id TEXT, thread_id TEXT, turn_id TEXT, pending_message_id TEXT);
+# V2 run-correlation schema stand-in (the columns bin/t3-events reads)
+sqlite3 "$TMP/t3home/userdata/statev2.sqlite" <<'SQL'
+CREATE TABLE orchestration_v2_projection_runs(run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, payload_json TEXT);
 SQL
 
 python3 "$ROOT/tests/fake_t3_server.py" --port "$PORT" --tokens-file "$TOKENS" --state "$STATE" --seed "$TMP/seed.json" &
@@ -91,7 +83,7 @@ export PATH="$TMP/bin:$PATH"
 # container mode, no /etc/t3ctl.conf: everything from the environment
 export T3CTL_CONF=/dev/null T3CTL_URL="http://127.0.0.1:$PORT" T3CODE_HOME="$TMP/t3home" T3CTL_T3_BIN="$TMP/bin/t3"
 export T3CTL_TOKEN_MODE=self T3CTL_TOKEN_FILE="$TMP/t3home/t3ctl.token" T3CTL_SESSION_FILE="$TMP/t3home/t3ctl.token.session"
-export T3CTL_DB="$TMP/t3home/userdata/state.sqlite" T3CTL_TAG="[kosmi]" T3CTL_NOTIFY_BIN=t3-notify
+export T3CTL_DB="$TMP/t3home/userdata/statev2.sqlite" T3CTL_TAG="[kosmi]" T3CTL_NOTIFY_BIN=t3-notify
 export T3CTL_ALLOW_FULL_ACCESS=0 T3CTL_DENY_ORIGINS=webhook:auto-demo
 unset T3CTL_MAX_RUNNING
 
@@ -138,13 +130,17 @@ TID=$(jq -r .threadId <<<"$out")
 create=$(jq -c '.[] | select(.type=="thread.create")' "$STATE" | tail -1)
 assert_contains "$create" "\"threadId\":\"$TID\"" "thread.create dispatched"
 assert_contains "$create" '"modelSelection":{"instanceId":"claudeAgent","model":"claude-fable-5-1"}' "literal instanceId:model selection"
-turn=$(jq -c '.[] | select(.type=="thread.turn.start")' "$STATE" | tail -1)
+assert_contains "$create" '"runtimeMode":"approval-required"' "thread.create mode"
+assert_contains "$create" '"createdBy":"agent","creationSource":"mcp"' "thread.create says who created it"
+turn=$(jq -c '.[] | select(.type=="message.dispatch")' "$STATE" | tail -1)
 assert_contains "$turn" "t3-notify --thread $TID --status done|blocked|approval" "callback footer names t3-notify + thread id"
-assert_contains "$turn" '"runtimeMode":"approval-required"' "turn.start mode"
-ok "new → thread.create + thread.turn.start with footer"
+assert_contains "$turn" '"dispatchMode":{"type":"start_immediately"}' "first message starts immediately"
+assert_contains "$out" '"turn":"running"' "receipt correlates the run started by the message"
+ok "new → thread.create + message.dispatch with footer"
 
 out=$("$T3CTL" say "$TID" "also update the docs")
 assert_contains "$out" '"mode":"approval-required"' "say inherits mode"
+assert_contains "$(jq -c '.[] | select(.type=="message.dispatch")' "$STATE" | tail -1)" '"dispatchMode":{"type":"queue_after_active"}' "say to a busy thread queues, never steers"
 ok "say inherits the thread's runtime mode"
 
 # ---- 3. full-access gate ----------------------------------------------------
@@ -189,8 +185,8 @@ assert_contains "$out" '"requestId":"r3".*"action":"left-for-human"' "chained co
 if grep -q '"requestId":"r4"' <<<"$out"; then fail "foreign thread's callback must not be considered"; fi
 out=$("$T3CTL" approve-callbacks)
 assert_contains "$out" '"requestId":"r1".*"action":"accepted"' "callback accepted"
-resp=$(jq -c '[.[] | select(.type=="thread.approval.respond")]' "$STATE")
-[ "$(jq length <<<"$resp")" -eq 1 ] || fail "expected exactly one approval.respond, got: $resp"
+resp=$(jq -c '[.[] | select(.type=="runtime-request.respond")]' "$STATE")
+[ "$(jq length <<<"$resp")" -eq 1 ] || fail "expected exactly one runtime-request.respond, got: $resp"
 assert_contains "$resp" '"requestId":"r1","decision":"accept"' "accept dispatched for r1 only"
 ok "approve-callbacks accepts only the exact t3-notify command in [kosmi] threads"
 
@@ -198,6 +194,7 @@ ok "approve-callbacks accepts only the exact t3-notify command in [kosmi] thread
 out=$("$T3CTL" list --active); assert_contains "$out" "$SEED_OURS" "list --active includes running seeded thread"
 out=$("$T3CTL" show "$SEED_OURS" -n 2); assert_contains "$out" '"seeded prompt"' "show returns messages"
 out=$("$T3CTL" search "seeded"); assert_contains "$out" '"matchedIn":"title"' "search matches titles"
+out=$("$T3CTL" search "update the docs"); assert_contains "$out" '"matchedIn":"user"' "search matches message bodies via searchThreads"
 out=$("$T3CTL" settle "$SEED_OTHER"); assert_contains "$out" '"op":"settle"' "settle has no ownership guard"
 ok "list/show/search/settle"
 
@@ -211,11 +208,11 @@ ok "project add"
 # ---- 9. project set-model + selftest ---------------------------------------
 out=$("$T3CTL" project set-model aikosmo-monorepo claudeAgent:claude-fable-5-1)
 assert_contains "$out" '"defaultModelSelection":{"instanceId":"claudeAgent","model":"claude-fable-5-1"}' "set-model output"
-meta=$(jq -c '.[] | select(.type=="project.meta.update")' "$STATE" | tail -1)
-assert_contains "$meta" "\"projectId\":\"$PID_PROJECT\"" "project.meta.update dispatched"
+meta=$(jq -c '.[] | select(.type=="project.update")' "$STATE" | tail -1)
+assert_contains "$meta" "\"projectId\":\"$PID_PROJECT\"" "project.update sent via projects.mutate"
 out=$("$T3CTL" new aikosmo-monorepo "uses project default")
 assert_contains "$(jq -c '.[] | select(.type=="thread.create")' "$STATE" | tail -1)" '"model":"claude-fable-5-1"' "new picks the project default"
-out=$("$T3CTL" contract-check); assert_contains "$out" '"ok":true' "contract-check"; assert_contains "$out" '"dbSchemaChecked":true' "contract-check covered the search schema"
+out=$("$T3CTL" contract-check); assert_contains "$out" '"ok":true' "contract-check"; assert_contains "$out" '"rpc":true' "contract-check covered the WebSocket RPC"; assert_contains "$out" '"dbSchemaChecked":true' "contract-check covered the run-correlation schema"
 ok "project set-model + contract-check"
 
 echo "all $pass checks passed"

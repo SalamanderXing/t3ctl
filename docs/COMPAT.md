@@ -1,8 +1,8 @@
 # Verified (t3ctl, t3) pairs
 
-t3ctl uses t3's internal orchestration HTTP API (`/api/orchestration/*`,
-`/api/auth/*`) and, for `search`, t3's SQLite schema. Neither is a public
-contract. Add a row whenever `t3ctl selftest` and `t3ctl search` pass on a
+t3ctl uses t3's internal orchestration API — HTTP reads under
+`/api/orchestration/*` and, since v0.3.0, Effect-RPC commands over `/ws` — and,
+for `t3-events`, t3's SQLite schema. Neither is a public contract. Add a row whenever `t3ctl selftest` and `t3ctl search` pass on a
 new t3 version; the procedure for re-extracting the contracts after a break
 is `t3-hermes-control.md` §4.
 
@@ -26,12 +26,17 @@ transport port before it can run on 0.0.46.
 Known fragile points, in the order they have actually broken or are most
 likely to:
 
-1. `search` — SQL lifted from `Layers/ProjectionSnapshotQuery.ts
-   searchActiveThreadRows`; any column rename breaks it (HTTP commands keep
-   working).
-2. Approval payload shape — `activities[].payload.{requestId, requestType,
-   detail, decision}`; the approver and `watch` depend on it.
-3. `thread.turn.start` / `thread.create` command fields (`modelSelection`,
-   `runtimeMode`, `interactionMode`, `branch`, `worktreePath`).
-4. `/api/orchestration/shell` snapshot fields used by `list`/`watch`
-   (`latestTurn.state`, `hasPendingApprovals`, `settledOverride`).
+1. The orchestration protocol version (`2`: the `x-t3-orchestration-protocol`
+   header on reads, `?orchestrationProtocol=2` on `/ws`). A bump shows up as
+   400s on reads and a 426 on the WebSocket upgrade.
+2. Approval correlation — `approval_request` turn item ↔ `command_execution`
+   item by `nativeItemRef.nativeId`; the approver keys on the command found
+   there and fails closed (left for a human) when there is none.
+3. V2 command fields (`thread.create`, `message.dispatch` with
+   `dispatchMode` and `createdBy`/`creationSource`, `runtime-request.respond`,
+   `run.interrupt`, `provider-session.detach`) and `projects.mutate`.
+4. Shell thread fields used by `list`/`watch` (`latestRunId`, `activeRunId`,
+   `status`, `pendingRuntimeRequest`, `settledOverride`) and the bounded
+   snapshot's `runs`/`runtimeRequests`/`turnItems`/`messages`.
+5. `t3-events`' SQL on `orchestration_v2_projection_runs`
+   (`json_extract(payload_json, '$.userMessageId')`).

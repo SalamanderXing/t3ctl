@@ -120,7 +120,7 @@ def observe(subscription, state, path=None, clock=time.time):
 
 @contextmanager
 def t3_database(path=None):
-    path = Path(path or os.environ.get('T3CTL_DB', str(Path(os.environ.get('T3CODE_HOME', '/data/t3')) / 'userdata/state.sqlite')))
+    path = Path(path or os.environ.get('T3CTL_DB', str(Path(os.environ.get('T3CODE_HOME', '/data/t3')) / 'userdata/statev2.sqlite')))
     db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
     try:
         yield db
@@ -128,11 +128,16 @@ def t3_database(path=None):
         db.close()
 
 
+# Orchestration V2 (t3 >= 0.0.46): a run records the user message that started
+# it, so the dispatched messageId → run mapping is authoritative.
+RUN_OF_MESSAGE = ("SELECT run_id FROM orchestration_v2_projection_runs "
+                  "WHERE thread_id=? AND json_extract(payload_json, '$.userMessageId')=?")
+
+
 def dispatch_turn(thread_id, message_id, source_path=None):
-    """Read T3's authoritative request-message → provider-turn mapping."""
+    """Read T3's authoritative dispatched-message → run mapping."""
     with t3_database(source_path) as db:
-        rows = db.execute('SELECT turn_id FROM projection_turns WHERE thread_id=? AND pending_message_id=? AND turn_id IS NOT NULL',
-                          (thread_id, message_id)).fetchall()
+        rows = db.execute(RUN_OF_MESSAGE, (thread_id, message_id)).fetchall()
         if len(rows) > 1:
             raise ValueError('Dispatch maps to multiple turns; refusing ambiguous ownership')
         return rows[0][0] if rows else None
@@ -145,11 +150,12 @@ def managed(thread_id, path=None, source_path=None):
         row = db.execute('SELECT message_id FROM subscriptions WHERE thread_id=?', (thread_id,)).fetchone()
     if row is None:
         return False
-    # A turn started through the desktop can also take over without registration.
+    # A turn started through the desktop can also take over without registration:
+    # managed only while the thread's latest run is the one our message started.
     with t3_database(source_path) as db:
-        return db.execute('''SELECT 1 FROM projection_threads AS thread JOIN projection_turns AS turn
-            ON thread.thread_id=turn.thread_id AND thread.latest_turn_id=turn.turn_id
-            WHERE thread.thread_id=? AND turn.pending_message_id=?''', (thread_id, row['message_id'])).fetchone() is not None
+        latest = db.execute('''SELECT json_extract(payload_json, '$.userMessageId') FROM orchestration_v2_projection_runs
+            WHERE thread_id=? ORDER BY ordinal DESC LIMIT 1''', (thread_id,)).fetchone()
+        return latest is not None and latest[0] == row['message_id']
 
 
 def poll(path=None, cli='t3ctl'):

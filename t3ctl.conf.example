@@ -9,7 +9,7 @@ T3CTL_URL=http://127.0.0.1:3773
 T3CTL_T3_USER=dev
 T3CTL_T3_WORKDIR=/data/workspace
 T3CTL_T3_VERSION_FILE=/etc/default/t3
-T3CTL_DB=/data/home/dev/.t3/userdata/state.sqlite   # for `t3ctl search` (read-only)
+T3CTL_DB=/data/home/dev/.t3/userdata/statev2.sqlite   # t3's V2 db; t3-events/contract-check read it (read-only)
 
 # Bearer token written by t3-token-renew (root-only).
 T3CTL_TOKEN_FILE=/etc/t3ctl/token
