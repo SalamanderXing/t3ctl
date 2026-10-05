@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""One Effect-RPC call over t3's /ws WebSocket, stdlib only.
+
+t3 0.0.46 (orchestration V2) removed POST /api/orchestration/dispatch; every
+command now goes through the WebSocket RPC. t3ctl is bash, so this does the
+one thing bash cannot: open the socket, send one Request, return its Exit.
+
+  t3-rpc METHOD [--stream]  < payload.json   -> success value on stdout
+
+Env: T3CTL_URL (default http://127.0.0.1:3773), T3CTL_BEARER (the session
+token). --stream returns the first chunk of a streaming RPC and interrupts it.
+Exit codes: 0 success; 2 RPC failure (cause JSON on stderr); 3 transport/auth
+(HTTP status of a refused upgrade on stderr, e.g. 401 or 426).
+"""
+import base64
+import json
+import os
+import socket
+import ssl
+import struct
+import sys
+from urllib.parse import urlparse
+
+PROTOCOL = "2"  # ORCHESTRATION_PROTOCOL_VERSION; /ws answers 426 without it
+
+
+def die(code, msg):
+    print(f"t3-rpc: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+class Ws:
+    def __init__(self, base, token, timeout):
+        u = urlparse(base)
+        port = u.port or (443 if u.scheme == "https" else 80)
+        sock = socket.create_connection((u.hostname, port), timeout=timeout)
+        if u.scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        self.sock = sock
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET /ws?orchestrationProtocol={PROTOCOL} HTTP/1.1\r\n"
+               f"Host: {u.hostname}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+               f"Authorization: Bearer {token}\r\n\r\n")
+        sock.sendall(req.encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                die(3, "connection closed during upgrade")
+            head += chunk
+        head, self.buf = head.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+        if " 101 " not in status + " ":
+            code = status.split(" ")[1] if len(status.split(" ")) > 1 else "?"
+            die(3, f"HTTP {code} on WebSocket upgrade ({status})")
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                die(3, "connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, text, opcode=1):
+        data = text.encode() if isinstance(text, str) else text
+        mask = os.urandom(4)
+        n = len(data)
+        hdr = bytes([0x80 | opcode])
+        if n < 126:
+            hdr += bytes([0x80 | n])
+        elif n < 65536:
+            hdr += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            hdr += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        self.sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv(self):
+        message = b""
+        while True:
+            b0, b1 = self._read(2)
+            opcode, n = b0 & 0x0F, b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            data = self._read(n)  # server frames are unmasked
+            if opcode == 8:
+                die(3, f"server closed the socket: {data[2:].decode(errors='replace')}")
+            if opcode == 9:
+                self.send(data, opcode=10)
+                continue
+            if opcode == 10:
+                continue
+            message += data
+            if b0 & 0x80:
+                return message.decode()
+
+
+def main():
+    args = sys.argv[1:]
+    stream = "--stream" in args
+    args = [a for a in args if a != "--stream"]
+    if len(args) != 1:
+        die(64, "usage: t3-rpc METHOD [--stream] < payload.json")
+    token = os.environ.get("T3CTL_BEARER") or die(64, "T3CTL_BEARER is not set")
+    raw = sys.stdin.read().strip()
+    payload = json.loads(raw) if raw else {}
+    ws = Ws(os.environ.get("T3CTL_URL", "http://127.0.0.1:3773"), token,
+            float(os.environ.get("T3CTL_RPC_TIMEOUT", "60")))
+    ws.send(json.dumps({"_tag": "Request", "id": "1", "tag": args[0], "payload": payload, "headers": []}))
+    while True:
+        frame = json.loads(ws.recv())
+        for msg in frame if isinstance(frame, list) else [frame]:
+            tag = msg.get("_tag")
+            if tag == "Ping":
+                ws.send(json.dumps({"_tag": "Pong"}))
+            elif tag == "Chunk" and str(msg.get("requestId")) == "1":
+                if stream:
+                    print(json.dumps(msg["values"][0]))
+                    ws.send(json.dumps({"_tag": "Interrupt", "requestId": "1", "interruptors": []}))
+                    return
+                ws.send(json.dumps({"_tag": "Ack", "requestId": "1"}))
+            elif tag == "Exit" and str(msg.get("requestId")) == "1":
+                exit_ = msg["exit"]
+                if exit_.get("_tag") == "Success":
+                    print(json.dumps(exit_.get("value")))
+                    return
+                print(json.dumps(exit_.get("cause")), file=sys.stderr)
+                sys.exit(2)
+            elif tag == "Defect":
+                die(2, f"defect: {json.dumps(msg.get('defect'))}")
+
+
+if __name__ == "__main__":
+    main()
