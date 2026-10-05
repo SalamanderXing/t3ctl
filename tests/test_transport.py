@@ -137,6 +137,15 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('legacy callback suppressed', result.stdout)
 
+    def test_listed_webhook_origin_is_event_managed(self):
+        self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(self.path / 'events.sqlite'),
+                         'HERMES_SESSION_ID': 'parent', 'HERMES_SESSION_KEY': 'route',
+                         'HERMES_SESSION_PLATFORM': 'webhook',
+                         'HERMES_SESSION_CHAT_ID': 'webhook:linear-comment:thread-root'})
+        self.assertEqual(self.cli('say', 'test-thread', 'One-shot')['monitoring'], 'manual')
+        self.env['T3CTL_EVENTS_ORIGINS'] = 'webhook:linear-comment:thread-'
+        self.assertEqual(self.cli('say', 'test-thread', 'Thread session')['monitoring'], 'events')
+
     def test_delayed_dispatch_cannot_adopt_foreign_output(self):
         outbox = self.path / 'events.sqlite'
         self.env.update({'T3CTL_EVENTS_ENABLED': '1', 'T3CTL_EVENTS_DB': str(outbox),

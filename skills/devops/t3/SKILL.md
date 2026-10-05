@@ -157,7 +157,10 @@ create the hermes cron yourself and tell the user what you scheduled.
   unless the user explicitly named that thread and asked.
 - Never start a thread from an unattended run (a webhook-triggered lane
   with nobody watching); t3 threads are only started from conversations with
-  people. Boxes enforce this with `T3CTL_DENY_ORIGINS`.
+  people. Boxes enforce this with `T3CTL_DENY_ORIGINS`. A webhook lane that
+  IS a conversation with a person (a teammate mentioning you in an issue
+  thread) is not unattended: when that lane gives you a terminal, start
+  threads there as from chat.
 - Never pass `--full-access` yourself; the deployment default decides. If the
   default is approval-required, a thread only runs unattended when the user
   explicitly says so.

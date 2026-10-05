@@ -53,10 +53,28 @@ def connect(path=None):
         db.close()
 
 
+def eligible(env):
+    """Whether the calling Hermes session takes T3 state changes as new turns.
+
+    Interactive messaging sessions do. CLI sessions and webhook/api_server runs
+    do not: a one-shot run has ended before its result arrives. The exception
+    is a webhook/api_server session whose chat id starts with a prefix listed
+    in T3CTL_EVENTS_ORIGINS (comma-separated) — a lane the operator knows keeps
+    one session across turns, such as one session per Linear thread.
+    """
+    if env.get('T3CTL_EVENTS_ENABLED') != '1' or not env.get('HERMES_SESSION_ID') or not env.get('HERMES_SESSION_KEY'):
+        return False
+    platform = env.get('HERMES_SESSION_PLATFORM')
+    if platform not in ('webhook', 'api_server'):
+        return bool(platform)
+    chat = env.get('HERMES_SESSION_CHAT_ID', '')
+    return any(chat.startswith(p.strip()) for p in env.get('T3CTL_EVENTS_ORIGINS', '').split(',') if p.strip())
+
+
 def register(receipt, env=None, path=None):
     env = os.environ if env is None else env
     sid, key = env.get('HERMES_SESSION_ID'), env.get('HERMES_SESSION_KEY')
-    if env.get('T3CTL_EVENTS_ENABLED') != '1' or not sid or not key or env.get('HERMES_SESSION_PLATFORM') in (None, '', 'webhook', 'api_server'):
+    if not eligible(env):
         # Successful manual dispatch transfers ownership away from the gateway.
         if Path(path or database_path()).exists():
             with connect(path) as db:
@@ -268,13 +286,15 @@ async def watch_gateway(runner, interval=15):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['register', 'pending', 'managed', 'status', 'turn'])
+    parser.add_argument('action', choices=['register', 'eligible', 'pending', 'managed', 'status', 'turn'])
     parser.add_argument('--thread')
     parser.add_argument('--message')
     args = parser.parse_args()
     if args.action == 'register':
         import sys
         print(json.dumps({'registered': register(json.load(sys.stdin))}))
+    elif args.action == 'eligible':
+        raise SystemExit(0 if eligible(os.environ) else 1)
     elif args.action == 'status':
         with connect() as db:
             print(json.dumps({'events': dict(db.execute('SELECT disposition, COUNT(*) FROM events GROUP BY disposition')),
