@@ -186,7 +186,9 @@ def poll(path=None, cli='t3ctl'):
         try:
             result = subprocess.run([cli, 'watch', subscription['thread_id'], '--timeout', '0',
                                      '--after-turn', subscription['previous_turn'], '--message-id', subscription['message_id']],
-                                    capture_output=True, text=True, timeout=150, check=True)
+                                    capture_output=True, text=True, timeout=150, check=True,
+                                    # the reply is injected into a conversation: bounded, unlike piped t3ctl output
+                                    env={**os.environ, 'T3CTL_TEXT_CAP': os.environ.get('T3CTL_EVENTS_TEXT_CAP', '20000')})
             observe(subscription, json.loads(result.stdout), path)
             with connect(path) as db:
                 db.execute('UPDATE subscriptions SET poll_failures=0, next_poll=0 WHERE thread_id=? AND dispatch_id=?',

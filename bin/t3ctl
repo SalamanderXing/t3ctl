@@ -58,7 +58,11 @@ case $DEFAULT_MODE in
   *) echo "t3ctl: invalid T3CTL_DEFAULT_MODE '$DEFAULT_MODE'; using approval-required" >&2; DEFAULT_MODE=approval-required;;
 esac
 DENY_ORIGINS=${T3CTL_DENY_ORIGINS:-}
-TEXT_CAP=${T3CTL_TEXT_CAP:-3000}   # chars of message text shown per message
+# Chars of message text shown per message (0 = no limit). The cap is for a
+# human at a terminal; an agent reading the output wants the whole reply
+# (Cactus was adding T3CTL_TEXT_CAP=50000 to most calls by hand).
+if [ -t 1 ]; then TEXT_CAP=${T3CTL_TEXT_CAP:-3000}; else TEXT_CAP=${T3CTL_TEXT_CAP:-0}; fi
+[[ $TEXT_CAP =~ ^[0-9]+$ ]] || TEXT_CAP=3000
 PROTO_HDR="x-t3-orchestration-protocol: 2"   # V2 read routes answer a bare 400 without it
 T3RPC=$(dirname "${BASH_SOURCE[0]}")/t3-rpc
 
@@ -76,8 +80,13 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
   t3ctl new <project> "<prompt>" [opts]   create thread + start first turn
         [--title T] [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access]
   t3ctl say <thread> "<text>" [opts]      start a turn on an existing thread
-        [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access | --inherit]
+        [--expect-turn ID] [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access | --inherit]
+                                          --expect-turn: refuse unless the thread's latest
+                                          turn is still ID (the one you read; "none" for
+                                          a thread without turns) — stops duplicate sends
   t3ctl show <thread> [-n TURNS]          messages, turn state, approvals
+  t3ctl last <thread> [--json]            the latest assistant reply, in full, as plain
+                                          text (--json: {threadId,turnId,turn,text})
   t3ctl search "<text>" [--limit N]       find threads by title or message
                                           content (case-insensitive substring)
   t3ctl watch <thread> [--message-id ID] [--timeout S] [--after-turn ID]      poll until the turn settles or an
@@ -110,6 +119,8 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
   t3ctl stop <thread> [--force]           stop the provider session
   t3ctl rm <thread> [--force]             delete the thread
 
+Message text is capped at T3CTL_TEXT_CAP chars (default 3000 on a terminal,
+unlimited when piped; 0 = unlimited).
 <thread> and <project> accept a full id, a unique id prefix, or (projects)
 an exact title / workspaceRoot basename. Modes: approval-required,
 auto-accept-edits, auto, full-access. --model takes a model name or
@@ -546,8 +557,9 @@ cmd_say() {
   # Continuing a thread inherits ITS runtime mode by default: owned threads
   # were created approval-required, and other people's threads keep whatever
   # they chose — a follow-up must not quietly downgrade (or upgrade) a session.
-  local thread="" text="" prompt_file="" mode="" imode="" explicit="" model="" msel=null
+  local thread="" text="" prompt_file="" mode="" imode="" explicit="" model="" msel=null expect_turn=""
   while [ $# -gt 0 ]; do case $1 in
+    --expect-turn) [ -n "${2:-}" ] || die "--expect-turn requires a turn id (or none)"; expect_turn=$2; shift 2;;
     --plan) imode=plan; shift;;
     --execute) imode=default; shift;;
     --prompt-file) [ -n "${2:-}" ] || die "--prompt-file requires a path or -"; prompt_file=$2; shift 2;;
@@ -565,6 +577,20 @@ cmd_say() {
   fi
   [ -n "$thread" ] && [ -n "$text" ] || die "usage: t3ctl say <thread> \"<text>\""
   resolve_thread "$thread"
+  # One sender at a time per thread, held until the new run is visible, so a
+  # second sender's --expect-turn check sees the first one's turn. Without
+  # it, two Hermes sessions woken by the same completion (relay, callback,
+  # a background watch) each sent their own follow-up to the same thread —
+  # 1.6 s apart on 2026-10-10.
+  local lockdir=${T3CTL_LOCK_DIR:-/tmp/t3ctl-locks-$(id -u)}
+  mkdir -p "$lockdir" && chmod 700 "$lockdir" || die "cannot create lock dir $lockdir"
+  exec 8>"$lockdir/say-$TID.lock"
+  flock -w 120 8 || die "another t3ctl say to thread $TID has held its lock for 120 s"
+  SNAP=$(shell_snap); resolve_thread "$TID"   # re-read: the state may have moved while we waited
+  if [ -n "$expect_turn" ]; then
+    local cur_turn; cur_turn=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
+    [ "$cur_turn" = "$expect_turn" ] || die "refused: thread $TID has moved past turn $expect_turn (latest is now $cur_turn) — someone else already sent a turn; read it (t3ctl last $TID) before deciding whether to send anything"
+  fi
   [ -n "$mode" ] || mode=$(jq -r '.runtimeMode' <<<"$THREAD")
   [ -n "$imode" ] || imode=$(jq -r '.interactionMode // "default"' <<<"$THREAD")
   [ -z "$model" ] || msel=$(resolve_model "$model")
@@ -582,6 +608,7 @@ cmd_say() {
   dispatch "$command" >/dev/null || return 1
   local visible state turn_id; visible=$(wait_turn_visible "$TID" "$(jq -r .messageId <<<"$command")")
   turn_id=${visible%% *}; state=${visible#* }
+  exec 8>&-   # new run visible (or given up on): next sender may check
   jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --arg turn_id "$turn_id" --arg old "$old" --arg message_id "$(jq -r .messageId <<<"$command")" --arg dispatch_id "$(jq -r .commandId <<<"$command")" \
     '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:$old, dispatchId:$dispatch_id, messageId:$message_id}' | register_events
 }
@@ -615,7 +642,27 @@ cmd_show() {
       userInputs,
       approvals,
       messages: [.messages[] | {role, createdAt,
-                  text: (if (.text|length) > $cap then (.text[:$cap] + "…[truncated]") else .text end)}]}'
+                  text: (if $cap > 0 and (.text|length) > $cap then (.text[:$cap] + "…[truncated]") else .text end)}]}'
+}
+
+cmd_last() {
+  # The thread's latest assistant reply, whole and as plain text — the thing
+  # `show | python -c …` was used for. --json adds the turn it belongs to, so
+  # the reader can pass that turn to `say --expect-turn`.
+  local thread="" json=false
+  while [ $# -gt 0 ]; do case $1 in
+    --json) json=true; shift;;
+    -*) die "unknown flag $1";;
+    *) [ -z "$thread" ] && thread=$1 || die "unexpected arg: $1"; shift;;
+  esac; done
+  [ -n "$thread" ] || die "usage: t3ctl last <thread> [--json]"
+  resolve_thread "$thread"
+  local out; out=$(thread_detail "$TID" 4 | jq -c '.thread
+    | {threadId: .id, turnId: (.latestTurn.turnId // null), turn: (.latestTurn.state // "none"),
+       text: ([.messages[] | select(.role == "assistant")] | last | .text // null)}')
+  if [ "$json" = true ]; then printf '%s\n' "$out"; return; fi
+  jq -e '.text != null' >/dev/null <<<"$out" || die "thread $TID has no assistant reply in its recent turns"
+  jq -j '.text' <<<"$out"; echo
 }
 
 cmd_search() {
@@ -806,7 +853,7 @@ cmd_watch() {
                  else [] end),
      lastAssistant: (if $reason == "not-visible" or $reason == "superseded" then null else ([$d.thread.messages[] | select(.role == "assistant")] | last
                      | if . == null then null
-                       elif (.text|length) > $cap then (.text[:$cap] + "…[truncated]")
+                       elif $cap > 0 and (.text|length) > $cap then (.text[:$cap] + "…[truncated]")
                        else .text end) end)}'
 }
 
@@ -958,7 +1005,10 @@ cmd_selftest() {
   command -v "$NOTIFY_BIN" >/dev/null 2>&1 || die "selftest: $NOTIFY_BIN is not installed — the callback leg cannot work"
 
   t0=$SECONDS
-  w=$(cmd_new "$project" "Connectivity self-test. Reply with exactly the word PONG and nothing else. Do not run tools, do not read or edit files." --title "selftest $(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  # The probe is always approval-required, whatever the deployment default:
+  # in full-access the callback never raises an approval, so the approver
+  # leg this exists to prove would go untested.
+  w=$(DEFAULT_MODE=approval-required MODE_FIXED="" cmd_new "$project" "Connectivity self-test. Reply with exactly the word PONG and nothing else. Do not run tools, do not read or edit files." --title "selftest $(date -u +%Y-%m-%dT%H:%M:%SZ)")
   tid=$(jq -r .threadId <<<"$w")
   echo "selftest: thread $tid" >&2
   SNAP=""; w=$(cmd_watch "$tid" --timeout 120)
@@ -1018,6 +1068,7 @@ case ${1:---help} in
   new)        shift; cmd_new "$@";;
   say)        shift; cmd_say "$@";;
   show)       shift; cmd_show "$@";;
+  last)       shift; cmd_last "$@";;
   answer)     shift; cmd_answer "$@";;
   search)     shift; cmd_search "$@";;
   watch)      shift; cmd_watch "$@";;

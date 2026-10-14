@@ -7,7 +7,7 @@ same box, and lets those threads call the agent back. Extracted from the
 versioned thing.
 
 ```
-bin/t3ctl                 the CLI (JSON/JSONL out): projects, models, list, new, say,
+bin/t3ctl                 the CLI (JSON/JSONL out): projects, models, list, new, say, last,
                           show, search, watch, approvals, approve, approve-callbacks,
                           settle/unsettle, interrupt/stop/rm, selftest
 bin/t3-token-renew        mints a 30 d bearer token as the t3 user, probes it, swaps

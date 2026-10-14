@@ -25,7 +25,8 @@ t3ctl projects                       # what projects exist
 t3ctl models                         # model choices usable with --model
 t3ctl list [--unsettled|--active|--all]   # threads + status (JSONL)
 t3ctl new <project> "<prompt>" [--title T] [--plan] [--model M]
-t3ctl say <thread> --prompt-file <path|-> [--execute] [--model M]   # follow-up turn on a thread
+t3ctl say <thread> --prompt-file <path|-> --expect-turn <turnId> [--execute] [--model M]   # follow-up turn
+t3ctl last <thread> [--json]         # latest assistant reply, full, plain text (--json adds turnId)
 t3ctl answer <thread> <requestId> --answers-file <path|->  # JSON keyed by question id
 t3ctl show <thread> [-n TURNS]       # messages, state, approvals
 t3ctl search "<text>" [--limit N]    # find threads: title OR message content
@@ -38,6 +39,8 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
 ```
 
 `<thread>`/`<project>` take a full id, unique id prefix, or project title.
+Piped output is never truncated (no `T3CTL_TEXT_CAP` needed); to read a
+reply use `t3ctl last`, not `show` plus a script.
 
 ## The normal flow
 
@@ -77,6 +80,24 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
 4. Follow-ups use the same thread. Add `--execute` when implementation has
    been authorized after planning; this changes interaction mode without
    changing runtime permissions. Omitting it inherits plan mode.
+
+## One sender per turn (`--expect-turn`)
+
+One finished turn can wake you more than once — the event relay, a
+callback, a background watch — and each wakeup is its own session that can
+see the same thread. Two of them answering it sends the thread two
+follow-ups (this happened: two different "round 5" briefs to one fixer
+thread, 28 s apart). So on a thread you are driving:
+
+- Read with `t3ctl last <thread> --json` (or `watch`/`show`) and keep its
+  `turnId`. Reply with `t3ctl say <thread> … --expect-turn <that turnId>`.
+- If `say` is **refused** ("has moved past turn …"), another session already
+  answered this turn. Read what it sent (`t3ctl last`, `show -n 2`) and do
+  not send again; usually the right reply is `[SILENT]`. Never retry the
+  refused `say` without `--expect-turn`.
+- Wait for completion through ONE channel: with `monitoring: events` the
+  relay is it — no background `watch` with completion notifications on top.
+  With `manual`, one `watch` (or the callback), not both.
 
 Use `--prompt-file` for substantial prompts and review feedback (or `-` for
 stdin). Write the text with a file tool or quoted heredoc first. Never embed
@@ -161,9 +182,10 @@ create the hermes cron yourself and tell the user what you scheduled.
   IS a conversation with a person (a teammate mentioning you in an issue
   thread) is not unattended: when that lane gives you a terminal, start
   threads there as from chat.
-- Never pass `--full-access` yourself; the deployment default decides. If the
-  default is approval-required, a thread only runs unattended when the user
-  explicitly says so.
+- Don't pass `--full-access` or `--mode`; the deployment default
+  (`T3CTL_DEFAULT_MODE`) decides, and `new` output says which mode you got.
+  Only when the default is approval-required and the user explicitly asks
+  for an unattended thread do you add `--full-access`.
 - One thread per task; don't retry a failed `new` in a loop (there is a
   running-threads cap and it exists to stop exactly that).
 - `t3ctl` errors are actionable: 401 → rotate the token (the error says how:
