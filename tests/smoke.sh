@@ -3,7 +3,8 @@
 #
 # Covers the contracts t3ctl relies on (dispatch shapes, read models), the
 # Kosmi guardrails (full-access refusal, ownership guard, running cap), the
-# callback footer + approve-callbacks matching, literal model selection,
+# callback footer + approve-callbacks matching, say --expect-turn (stale and
+# concurrent duplicate sends), last + the text cap, literal model selection,
 # project set-model, selftest, search, and token self-minting on 401.
 #
 #   bash tests/smoke.sh
@@ -29,6 +30,7 @@ STATE=$TMP/state.json
 PID_PROJECT=11111111-1111-4111-8111-111111111111
 SEED_OURS=22222222-2222-4222-8222-222222222222
 SEED_OTHER=33333333-3333-4333-8333-333333333333
+LONG=$(printf 'x%.0s' $(seq 1 3500))   # an assistant reply longer than the 3000-char terminal cap
 cat > "$TMP/seed.json" <<EOF
 {"projects":[{"id":"$PID_PROJECT","title":"aikosmo-monorepo","workspaceRoot":"/data/repo","defaultModelSelection":null}],
  "threads":[
@@ -50,7 +52,7 @@ cat > "$TMP/seed.json" <<EOF
    "requests":[
      {"id":"r4","kind":"command","status":"pending","runId":"t-2",
       "command":"t3-notify --thread $SEED_OTHER --status done \\"not ours\\""}],
-   "messages":[]}
+   "messages":[{"id":"m-3","role":"assistant","createdAt":"2026-09-08T09:01:00.000Z","text":"$LONG","runId":"t-2"}]}
  ]}
 EOF
 
@@ -142,6 +144,30 @@ out=$("$T3CTL" say "$TID" "also update the docs")
 assert_contains "$out" '"mode":"approval-required"' "say inherits mode"
 assert_contains "$(jq -c '.[] | select(.type=="message.dispatch")' "$STATE" | tail -1)" '"dispatchMode":{"type":"queue_after_active"}' "say to a busy thread queues, never steers"
 ok "say inherits the thread's runtime mode"
+
+# ---- 2b. say --expect-turn: a sender that read an older turn is refused ----
+cur=$("$T3CTL" last "$TID" --json | jq -r .turnId)
+[ -n "$cur" ] && [ "$cur" != null ] || fail "last --json carries the latest turn id"
+before=$(jq '[.[] | select(.type=="message.dispatch")] | length' "$STATE")
+if "$T3CTL" say "$TID" "stale follow-up" --expect-turn t-stale 2>"$TMP/err"; then fail "say --expect-turn with a stale turn must be refused"; fi
+assert_contains "$(cat "$TMP/err")" "has moved past turn t-stale (latest is now $cur)" "stale-turn refusal names both turns"
+[ "$(jq '[.[] | select(.type=="message.dispatch")] | length' "$STATE")" -eq "$before" ] || fail "refused say must not dispatch"
+out=$("$T3CTL" say "$TID" "round 2" --expect-turn "$cur"); assert_contains "$out" "\"previousTurnId\":\"$cur\"" "matching --expect-turn sends"
+cur=$(jq -r .turnId <<<"$out")
+"$T3CTL" say "$TID" "copy A" --expect-turn "$cur" >"$TMP/a" 2>&1 & pa=$!
+"$T3CTL" say "$TID" "copy B" --expect-turn "$cur" >"$TMP/b" 2>&1 & pb=$!
+ra=0; rb=0; wait $pa || ra=$?; wait $pb || rb=$?
+[ $((ra == 0 ? 1 : 0)) -ne $((rb == 0 ? 1 : 0)) ] || fail "exactly one of two concurrent senders with the same --expect-turn must win (rc $ra/$rb): $(cat "$TMP/a" "$TMP/b")"
+assert_contains "$(cat "$TMP/a" "$TMP/b")" "has moved past turn $cur" "the losing sender is told why"
+ok "say --expect-turn refuses stale and concurrent duplicate sends"
+
+# ---- 2c. last / text cap ----------------------------------------------------
+out=$("$T3CTL" last "$SEED_OTHER"); [ ${#out} -eq 3500 ] || fail "last prints the whole reply as plain text (got ${#out} chars)"
+out=$("$T3CTL" show "$SEED_OTHER"); assert_contains "$out" "$LONG\"" "piped show is not truncated"
+out=$(T3CTL_TEXT_CAP=100 "$T3CTL" show "$SEED_OTHER"); assert_contains "$out" '…\[truncated\]' "explicit T3CTL_TEXT_CAP still truncates"
+if "$T3CTL" last "$SEED_OURS" 2>"$TMP/err"; then fail "last on a thread without a reply must fail"; fi
+assert_contains "$(cat "$TMP/err")" "no assistant reply" "last says why"
+ok "last prints the full reply; piped output is uncapped"
 
 # ---- 3. full-access gate ----------------------------------------------------
 if "$T3CTL" new aikosmo-monorepo "x" --full-access 2>"$TMP/err"; then fail "--full-access must be refused with T3CTL_ALLOW_FULL_ACCESS=0"; fi
