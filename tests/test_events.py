@@ -138,6 +138,15 @@ class EventsTest(unittest.TestCase):
     def test_webhook_cannot_register_callback_loop(self):
         self.assertFalse(events.register(self.receipt, {**self.env, 'HERMES_SESSION_PLATFORM': 'webhook'}, self.db))
 
+    def test_listed_persistent_webhook_origin_registers(self):
+        webhook = {**self.env, 'HERMES_SESSION_PLATFORM': 'webhook',
+                   'HERMES_SESSION_CHAT_ID': 'webhook:linear-comment:thread-abc',
+                   'T3CTL_EVENTS_ORIGINS': 'webhook:other, webhook:linear-comment:thread-'}
+        self.assertTrue(events.register(self.receipt, webhook, self.db))
+        one_shot = {**webhook, 'HERMES_SESSION_CHAT_ID': 'webhook:linear-comment:0f6e'}
+        self.assertFalse(events.eligible(one_shot))
+        self.assertFalse(events.eligible({**webhook, 'T3CTL_EVENTS_ORIGINS': ''}))
+
 
 if __name__ == '__main__':
     unittest.main()
