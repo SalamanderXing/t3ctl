@@ -30,6 +30,8 @@ STATE=$TMP/state.json
 PID_PROJECT=11111111-1111-4111-8111-111111111111
 SEED_OURS=22222222-2222-4222-8222-222222222222
 SEED_OTHER=33333333-3333-4333-8333-333333333333
+SEED_SETTLED=44444444-4444-4444-8444-444444444444    # on the app's settled shelf
+SEED_ARCHIVED=55555555-5555-4555-8555-555555555555   # archived (only --all shows it)
 LONG=$(printf 'x%.0s' $(seq 1 3500))   # an assistant reply longer than the 3000-char terminal cap
 cat > "$TMP/seed.json" <<EOF
 {"projects":[{"id":"$PID_PROJECT","title":"aikosmo-monorepo","workspaceRoot":"/data/repo","defaultModelSelection":null}],
@@ -52,7 +54,15 @@ cat > "$TMP/seed.json" <<EOF
    "requests":[
      {"id":"r4","kind":"command","status":"pending","runId":"t-2",
       "command":"t3-notify --thread $SEED_OTHER --status done \\"not ours\\""}],
-   "messages":[{"id":"m-3","role":"assistant","createdAt":"2026-09-08T09:01:00.000Z","text":"$LONG","runId":"t-2"}]}
+   "messages":[{"id":"m-3","role":"assistant","createdAt":"2026-09-08T09:01:00.000Z","text":"$LONG","runId":"t-2"}]},
+  {"id":"$SEED_SETTLED","title":"Settled thread","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
+   "settledOverride":"settled","updatedAt":"2026-09-08T08:00:00.000Z",
+   "runs":[{"id":"t-3","status":"completed","userMessageId":"m-4"}],
+   "messages":[{"id":"m-4","role":"user","createdAt":"2026-09-08T08:00:00.000Z","text":"old prompt","runId":"t-3"}]},
+  {"id":"$SEED_ARCHIVED","title":"Archived thread","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
+   "archivedAt":"2026-09-08T07:30:00.000Z","updatedAt":"2026-09-08T07:00:00.000Z",
+   "runs":[{"id":"t-4","status":"completed","userMessageId":"m-5"}],
+   "messages":[{"id":"m-5","role":"user","createdAt":"2026-09-08T07:00:00.000Z","text":"archived prompt","runId":"t-4"}]}
  ]}
 EOF
 
@@ -217,11 +227,38 @@ assert_contains "$resp" '"requestId":"r1","decision":"accept"' "accept dispatche
 ok "approve-callbacks accepts only the exact t3-notify command in [kosmi] threads"
 
 # ---- 7. list / show / search / settle --------------------------------------
-out=$("$T3CTL" list --active); assert_contains "$out" "$SEED_OURS" "list --active includes running seeded thread"
+# list filters: bare = inbox (unsettled, unarchived); --unsettled alias; --unarchived = settled too; --all = archived too
+has()    { grep -q "$2" <<<"$1" || fail "$3 (missing $2)"; }
+hasnot() { if grep -q "$2" <<<"$1"; then fail "$3 (unexpected $2)"; fi; }
+out=$("$T3CTL" list)
+has "$out" "$SEED_OURS" "bare list has the running unsettled thread"
+has "$out" "$SEED_OTHER" "bare list has the idle unsettled thread"
+hasnot "$out" "$SEED_SETTLED" "bare list is the inbox: settled threads excluded"
+hasnot "$out" "$SEED_ARCHIVED" "bare list excludes archived threads"
+[ "$(jq -r .id <<<"$out" | head -1)" = "$SEED_OURS" ] || fail "list is newest-first"
+[ "$("$T3CTL" list --unsettled)" = "$out" ] || fail "list --unsettled must equal the bare list"
+out=$("$T3CTL" list --unarchived)
+has "$out" "$SEED_OURS" "--unarchived has unsettled threads"
+has "$out" "$SEED_SETTLED" "--unarchived adds settled threads"
+hasnot "$out" "$SEED_ARCHIVED" "--unarchived excludes archived threads"
+assert_contains "$(jq -c "select(.id==\"$SEED_SETTLED\")" <<<"$out")" '"settled":true' "settled flag reported"
+out=$("$T3CTL" list --all)
+has "$out" "$SEED_SETTLED" "--all has settled threads"
+has "$out" "$SEED_ARCHIVED" "--all includes archived threads"
+out=$("$T3CTL" list --active)
+has "$out" "$SEED_OURS" "--active has the running thread"
+hasnot "$out" "$SEED_SETTLED" "--active excludes settled idle threads"
+if "$T3CTL" list --bogus 2>"$TMP/err"; then fail "unknown list flag must error"; fi
+assert_contains "$(cat "$TMP/err")" "unknown flag --bogus" "list flag error"
+if "$T3CTL" list --all --active 2>/dev/null; then fail "list must take a single flag"; fi
+ok "list: bare = inbox; --unsettled alias; --unarchived adds settled; --all adds archived; --active unchanged"
 out=$("$T3CTL" show "$SEED_OURS" -n 2); assert_contains "$out" '"seeded prompt"' "show returns messages"
 out=$("$T3CTL" search "seeded"); assert_contains "$out" '"matchedIn":"title"' "search matches titles"
 out=$("$T3CTL" search "update the docs"); assert_contains "$out" '"matchedIn":"user"' "search matches message bodies via searchThreads"
 out=$("$T3CTL" settle "$SEED_OTHER"); assert_contains "$out" '"op":"settle"' "settle has no ownership guard"
+if "$T3CTL" list | grep -q "$SEED_OTHER"; then fail "a settled thread must leave the bare list"; fi
+out=$("$T3CTL" unsettle "$SEED_OTHER"); assert_contains "$out" '"op":"unsettle"' "unsettle"
+"$T3CTL" list | grep -q "$SEED_OTHER" || fail "an unsettled thread must return to the bare list"
 ok "list/show/search/settle"
 
 # ---- 8. project add (idempotent) --------------------------------------------

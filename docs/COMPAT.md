@@ -15,6 +15,13 @@ is `t3-hermes-control.md` §4.
 | v0.3.0 | 0.0.46-nightly.20261014.3118 | v0.21.6 | 2026-10-14 | `contract-check` ok (`rpc` + `dbSchemaChecked`, 2 projects / 598 threads); `selftest` ok — PONG 72 s, callback approved unattended at 99 s (slow first turn right after the restart), probe deleted. Server took ~45 s to listen after restart |
 | v0.4.0 | 0.0.46-nightly.20261014.3118 | v0.21.6 | 2026-10-14 | `contract-check` ok; `last` and a stale `say --expect-turn` refusal checked on a live thread; `selftest` ok with `T3CTL_DEFAULT_MODE=full-access` on the box (probe forced to approval-required) — PONG 101 s, callback approved unattended at 154 s, probe deleted |
 
+Behaviour changes callers may notice (not t3-version related):
+
+- after v0.4.0: `t3ctl list` with no flag returns only the app's inbox
+  (unsettled, unarchived threads) instead of every non-archived thread.
+  `--unsettled` is an alias; the old default output is `--unarchived`;
+  `--active` and `--all` are unchanged.
+
 **t3ctl ≤ v0.2.0 cannot drive t3 ≥ 0.0.46** (orchestration V2: HTTP
 dispatch removed, protocol header required on reads) and v0.3.0 cannot drive
 t3 < 0.0.46. Bump `T3_VERSION` and the t3ctl pin together. V2 seeds its own

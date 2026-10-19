@@ -23,7 +23,7 @@ parse it, don't paste it raw at the user.
 ```bash
 t3ctl projects                       # what projects exist
 t3ctl models                         # model choices usable with --model
-t3ctl list [--unsettled|--active|--all]   # threads + status (JSONL)
+t3ctl list [--unarchived|--active|--all]  # threads + status (JSONL); bare = the inbox (unsettled)
 t3ctl new <project> "<prompt>" [--title T] [--plan] [--model M]
 t3ctl say <thread> --prompt-file <path|-> --expect-turn <turnId> [--execute] [--model M]   # follow-up turn
 t3ctl last <thread> [--json]         # latest assistant reply, full, plain text (--json adds turnId)
@@ -119,7 +119,7 @@ is my distillation thread doing", "tell my t3 thread to also fix X". Find it
 with `t3ctl search "<words>"` (matches titles AND message content,
 case-insensitive — use this when the user describes a thread by topic rather than
 exact title: "the thread where we discussed runner costs"), or `t3ctl list`
-for a plain overview; read it with `show`, continue it with `say`. A `say` turn runs in the thread's own runtime mode (his full-access
+for the inbox (`--unarchived` for every non-archived thread, settled ones too); read it with `show`, continue it with `say`. A `say` turn runs in the thread's own runtime mode (his full-access
 threads stay full-access — that is his setting, don't fight it, and don't
 pass `--mode` to change his threads). What stays off-limits without an
 explicit ask is killing them: `stop`/`interrupt`/`rm`.
@@ -198,9 +198,12 @@ create the hermes cron yourself and tell the user what you scheduled.
 Two different questions — use the right filter:
 
 - **"unsettled" / "pending" / "my inbox" / "open tasks"** →
-  `t3ctl list --unsettled`. This is exactly the inbox the T3 Code app shows:
-  threads with activity the user hasn't settled (shelved) yet, whether or not
-  anything is running. Finished-but-not-yet-settled work lives here.
+  `t3ctl list` (bare; `--unsettled` is an explicit alias). This is exactly the
+  inbox the T3 Code app shows: threads with activity the user hasn't settled
+  (shelved) yet, whether or not anything is running. Finished-but-not-yet-settled
+  work lives here. Settled threads are NOT in this output: for the old full
+  view (every non-archived thread, settled or not) use `t3ctl list --unarchived`;
+  `--all` adds archived threads too.
 - **"running right now" / "busy?"** → `t3ctl list --active`: turns in
   flight, pending approvals/user input. Empty means nothing is *executing*,
   NOT that the inbox is empty.
