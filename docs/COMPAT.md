@@ -14,10 +14,11 @@ is `t3-hermes-control.md` §4.
 | v0.3.0 | 0.0.46-nightly.20261003.2623 | v0.21.5 (2026.9.24) | 2026-10-03 | First orchestration V2 build: commands over `/ws` RPC, reads with `x-t3-orchestration-protocol: 2`. `contract-check` ok (`rpc` + `dbSchemaChecked`, 2 projects / 322 threads); live `selftest` PONG 13 s, callback approved unattended in 21 s (codex, `bash -lc` wrapper); claude verified on a scratch server (PONG 10 s, callback 11 s, chained callback left for a human). V1 threads import without runs, so they list as `turn: none` until their next message. V2 records an interrupted claude run as `completed` |
 | v0.3.0 | 0.0.46-nightly.20261014.3118 | v0.21.6 | 2026-10-14 | `contract-check` ok (`rpc` + `dbSchemaChecked`, 2 projects / 598 threads); `selftest` ok — PONG 72 s, callback approved unattended at 99 s (slow first turn right after the restart), probe deleted. Server took ~45 s to listen after restart |
 | v0.4.0 | 0.0.46-nightly.20261014.3118 | v0.21.6 | 2026-10-14 | `contract-check` ok; `last` and a stale `say --expect-turn` refusal checked on a live thread; `selftest` ok with `T3CTL_DEFAULT_MODE=full-access` on the box (probe forced to approval-required) — PONG 101 s, callback approved unattended at 154 s, probe deleted |
+| v0.5.0 | 0.0.46-nightly.20261014.3118 | v0.21.6 (2026.9.24) | 2026-10-19 | `contract-check` ok (`rpc` + `dbSchemaChecked`, 3 projects / 904 threads). `list` default changed to the inbox: bare `list` 68 rows vs 904 for `--unarchived`/`--all`, `--active` 4, on the live box. Also merges the persistent-webhook-origins event relay (`T3CTL_EVENTS_ORIGINS`, PR #3) that Kosmi's vendored copy was already pinned to. Suite: 18 smoke checks + 27 unit tests pass |
 
 Behaviour changes callers may notice (not t3-version related):
 
-- after v0.4.0: `t3ctl list` with no flag returns only the app's inbox
+- v0.5.0: `t3ctl list` with no flag returns only the app's inbox
   (unsettled, unarchived threads) instead of every non-archived thread.
   `--unsettled` is an alias; the old default output is `--unarchived`;
   `--active` and `--all` are unchanged.
