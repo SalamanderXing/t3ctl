@@ -10,6 +10,9 @@ versioned thing.
 bin/t3ctl                 the CLI (JSON/JSONL out): projects, models, list, new, say, last,
                           show, search, watch, approvals, approve, approve-callbacks,
                           settle/unsettle, interrupt/stop/rm, selftest
+                          (`list` with no flag is the app's inbox — unsettled,
+                          unarchived; `--unarchived` is every non-archived
+                          thread, `--all` adds archived, `--active` only in-flight)
 bin/t3-token-renew        mints a 30 d bearer token as the t3 user, probes it, swaps
                           it in root-only, revokes the predecessor; alerts on failure
 bin/t3-notify             a session's callback to the agent: signed POST to the hermes

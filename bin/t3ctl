@@ -74,9 +74,12 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
 
   t3ctl projects                          projects (id, title, workspaceRoot)
   t3ctl models                            model selections usable with --model
-  t3ctl list [--all|--active|--unsettled] threads; --all includes archived,
-                                          --active only running/attention,
-                                          --unsettled the app's inbox
+  t3ctl list [--unarchived|--active|--all] threads (JSONL). Default = the app's
+                                          inbox (unsettled, unarchived; --unsettled
+                                          is an alias); --unarchived every
+                                          non-archived thread, settled too;
+                                          --active only running/attention;
+                                          --all everything, archived included
   t3ctl new <project> "<prompt>" [opts]   create thread + start first turn
         [--title T] [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access]
   t3ctl say <thread> "<text>" [opts]      start a turn on an existing thread
@@ -429,8 +432,12 @@ cmd_models() {
 }
 
 cmd_list() {
-  local filter=default
-  case ${1:-} in --all) filter=all;; --active) filter=active;; --unsettled) filter=unsettled;; "") ;; *) die "unknown flag $1";; esac
+  # Default = the app's inbox (unsettled, non-archived): a bare `list` on a
+  # long-lived box otherwise returns every thread ever (870 rows). --unarchived
+  # is the pre-v0.5 default (settled + unsettled, archived excluded).
+  local filter=unsettled
+  case ${1:-} in --all) filter=all;; --active) filter=active;; --unsettled|"") filter=unsettled;; --unarchived) filter=unarchived;; *) die "unknown flag $1 (list takes --unsettled|--unarchived|--active|--all)";; esac
+  [ $# -le 1 ] || die "list takes a single flag"
   # "settled" is server-authoritative: the decider resets settledOverride to
   # null on any real activity, so settledOverride=="settled" IS the app's
   # settled shelf and everything else is its inbox ("unsettled").
