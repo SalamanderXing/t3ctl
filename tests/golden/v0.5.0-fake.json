@@ -1,0 +1,408 @@
+{
+ "answer": {
+  "{}": {
+   "sequence": "int"
+  }
+ },
+ "approvals": {
+  "{}": {
+   "createdAt": "str",
+   "payload": {
+    "{}": {
+     "decision": "null",
+     "detail": "str",
+     "requestId": "str",
+     "requestKind": "str",
+     "requestType": "str",
+     "status": "str"
+    }
+   },
+   "summary": "str",
+   "turnId": "str"
+  }
+ },
+ "approve": {
+  "{}": {
+   "decision": "str",
+   "requestId": "str",
+   "responded": "bool",
+   "threadId": "str"
+  }
+ },
+ "approve-callbacks --dry-run": {
+  "{}": {
+   "action": "str",
+   "detail": "str",
+   "requestId": "str",
+   "threadId": "str",
+   "title": "str"
+  }
+ },
+ "interrupt": {
+  "{}": {
+   "done": "bool",
+   "op": "str",
+   "threadId": "str"
+  }
+ },
+ "last --json": {
+  "{}": {
+   "text": "str",
+   "threadId": "str",
+   "turn": "str",
+   "turnId": "str"
+  }
+ },
+ "list": {
+  "{}": {
+   "id": "str",
+   "lastError": "null",
+   "mode": "str",
+   "pendingApprovals": "bool",
+   "pendingUserInput": "bool",
+   "project": "str",
+   "session": "str",
+   "settled": "bool",
+   "snoozedUntil": "null",
+   "title": "str",
+   "turn": "str",
+   "updatedAt": "str"
+  }
+ },
+ "list --active": {
+  "{}": {
+   "id": "str",
+   "lastError": "null",
+   "mode": "str",
+   "pendingApprovals": "bool",
+   "pendingUserInput": "bool",
+   "project": "str",
+   "session": "str",
+   "settled": "bool",
+   "snoozedUntil": "null",
+   "title": "str",
+   "turn": "str",
+   "updatedAt": "str"
+  }
+ },
+ "list --all": {
+  "{}": {
+   "id": "str",
+   "lastError": "null",
+   "mode": "str",
+   "pendingApprovals": "bool",
+   "pendingUserInput": "bool",
+   "project": "str",
+   "session": "str",
+   "settled": "bool",
+   "snoozedUntil": "null",
+   "title": "str",
+   "turn": "str",
+   "updatedAt": "str"
+  }
+ },
+ "list --unarchived": {
+  "{}": {
+   "id": "str",
+   "lastError": "null",
+   "mode": "str",
+   "pendingApprovals": "bool",
+   "pendingUserInput": "bool",
+   "project": "str",
+   "session": "str",
+   "settled": "bool",
+   "snoozedUntil": "null",
+   "title": "str",
+   "turn": "str",
+   "updatedAt": "str"
+  }
+ },
+ "models": {
+  "{}": {
+   "instanceId": "str",
+   "lastUsed": "str",
+   "model": "str",
+   "projectDefault": "bool",
+   "threads": "int"
+  }
+ },
+ "new": {
+  "{}": {
+   "dispatchId": "str",
+   "messageId": "str",
+   "mode": "str",
+   "model": "str",
+   "monitoring": "str",
+   "previousTurnId": "str",
+   "threadId": "str",
+   "title": "str",
+   "turn": "str",
+   "turnId": "str"
+  }
+ },
+ "project add": {
+  "{}": {
+   "created": "bool",
+   "id": "str",
+   "title": "str",
+   "workspaceRoot": "str"
+  }
+ },
+ "project set-model": {
+  "{}": {
+   "defaultModelSelection": {
+    "{}": {
+     "instanceId": "str",
+     "model": "str"
+    }
+   },
+   "projectId": "str"
+  }
+ },
+ "projects": {
+  "{}": {
+   "id": "str",
+   "model": "null",
+   "title": "str",
+   "workspaceRoot": "str"
+  }
+ },
+ "rm": {
+  "{}": {
+   "done": "bool",
+   "op": "str",
+   "threadId": "str"
+  }
+ },
+ "say": {
+  "{}": {
+   "dispatchId": "str",
+   "messageId": "str",
+   "mode": "str",
+   "monitoring": "str",
+   "previousTurnId": "str",
+   "threadId": "str",
+   "turn": "str",
+   "turnId": "str"
+  }
+ },
+ "search message": {
+  "{}": {
+   "matchedIn": "str",
+   "messageCreatedAt": "str",
+   "project": "str",
+   "snippet": "str",
+   "threadId": "str",
+   "title": "str",
+   "updatedAt": "str"
+  }
+ },
+ "search title": {
+  "{}": {
+   "matchedIn": "str",
+   "project": "str",
+   "snippet": "str",
+   "threadId": "str",
+   "title": "str",
+   "updatedAt": "str"
+  }
+ },
+ "settle": {
+  "{}": {
+   "done": "bool",
+   "op": "str",
+   "threadId": "str"
+  }
+ },
+ "show": {
+  "{}": {
+   "approvals": {
+    "[]": null
+   },
+   "id": "str",
+   "interaction": "str",
+   "latestTurn": {
+    "{}": {
+     "state": "str",
+     "turnId": "str",
+     "userMessageId": "str"
+    }
+   },
+   "messages": {
+    "[]": {
+     "{}": {
+      "createdAt": "str",
+      "role": "str",
+      "text": "str"
+     }
+    }
+   },
+   "mode": "str",
+   "session": {
+    "{}": {
+     "lastError": "null",
+     "status": "str"
+    }
+   },
+   "title": "str",
+   "userInputs": {
+    "[]": null
+   }
+  }
+ },
+ "show pending": {
+  "{}": {
+   "approvals": {
+    "[]": null
+   },
+   "id": "str",
+   "interaction": "str",
+   "latestTurn": {
+    "{}": {
+     "state": "str",
+     "turnId": "str",
+     "userMessageId": "str"
+    }
+   },
+   "messages": {
+    "[]": {
+     "{}": {
+      "createdAt": "str",
+      "role": "str",
+      "text": "str"
+     }
+    }
+   },
+   "mode": "str",
+   "session": {
+    "{}": {
+     "lastError": "null",
+     "status": "str"
+    }
+   },
+   "title": "str",
+   "userInputs": {
+    "[]": {
+     "{}": {
+      "questions": {
+       "[]": {
+        "{}": {
+         "header": "str",
+         "id": "str",
+         "options": {
+          "[]": {
+           "{}": {
+            "description": "str",
+            "label": "str"
+           }
+          }
+         },
+         "question": "str"
+        }
+       }
+      },
+      "requestId": "str"
+     }
+    }
+   }
+  }
+ },
+ "token status": {
+  "{}": {
+   "mode": "str",
+   "probe": "int",
+   "sessionId": "str",
+   "tokenFile": "str",
+   "valid": "bool"
+  }
+ },
+ "unsettle": {
+  "{}": {
+   "done": "bool",
+   "op": "str",
+   "threadId": "str"
+  }
+ },
+ "watch pending-approval": {
+  "{}": {
+   "approvals": {
+    "[]": {
+     "{}": {
+      "createdAt": "str",
+      "payload": {
+       "{}": {
+        "decision": "null",
+        "detail": "str",
+        "requestId": "str",
+        "requestKind": "str",
+        "requestType": "str",
+        "status": "str"
+       }
+      },
+      "summary": "str",
+      "turnId": "str"
+     }
+    }
+   },
+   "lastAssistant": "null",
+   "lastError": "null",
+   "reason": "str",
+   "turn": "str",
+   "turnId": "str",
+   "userInputs": {
+    "[]": null
+   }
+  }
+ },
+ "watch pending-user-input": {
+  "{}": {
+   "approvals": {
+    "[]": null
+   },
+   "lastAssistant": "null",
+   "lastError": "null",
+   "reason": "str",
+   "turn": "str",
+   "turnId": "str",
+   "userInputs": {
+    "[]": {
+     "{}": {
+      "questions": {
+       "[]": {
+        "{}": {
+         "header": "str",
+         "id": "str",
+         "options": {
+          "[]": {
+           "{}": {
+            "description": "str",
+            "label": "str"
+           }
+          }
+         },
+         "question": "str"
+        }
+       }
+      },
+      "requestId": "str"
+     }
+    }
+   }
+  }
+ },
+ "watch settled": {
+  "{}": {
+   "approvals": {
+    "[]": null
+   },
+   "lastAssistant": "str",
+   "lastError": "null",
+   "reason": "str",
+   "turn": "str",
+   "turnId": "str",
+   "userInputs": {
+    "[]": null
+   }
+  }
+ }
+}
