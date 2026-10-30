@@ -88,11 +88,11 @@ def scenario(work: Path):
         ('watch pending-approval', ['watch', OURS, '--timeout', '0'], None),
         ('approvals', ['approvals', OURS], None),
         ('approve-callbacks --dry-run', ['approve-callbacks', '--dry-run'], None),
+        ('settle', ['settle', OTHER], None),   # before `say`: T3 refuses to settle a running thread
+        ('unsettle', ['unsettle', OTHER], None),
         ('new', ['new', 'proj', 'hello', '--model', 'codex:gpt-test'], None),
         ('say', ['say', OTHER, 'follow up'], None),
         ('answer', ['answer', ASKING, 'q1', '--answers-file', '-'], json.dumps({'storage': 'Existing database'})),
-        ('settle', ['settle', OTHER], None),
-        ('unsettle', ['unsettle', OTHER], None),
         ('interrupt', ['interrupt', OURS], None),
         ('token status', ['token', 'status'], None),
         ('project set-model', ['project', 'set-model', 'proj', 'codex:gpt-test'], None),
