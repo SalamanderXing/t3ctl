@@ -415,10 +415,11 @@ ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerpri
   esac
 }
 
-ledger_mark() { # $1 dispatch id, $2 attempted|accepted (failures only warn: the entry stays protective)
+ledger_mark() { # $1 dispatch id, $2 attempted|accepted, [$3 previous turn at this send] (failures only warn: the entry stays protective)
   ( umask 077
     exec 7>>"$LEDGER.lock" && flock -w 30 7 || exit 1
-    jq -c --arg d "$1" --arg st "$2" 'if .dispatchId == $d then .state = $st else . end' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+    jq -c --arg d "$1" --arg st "$2" --arg p "${3:-}" \
+      'if .dispatchId == $d then .state = $st | (if $p == "" then . else .previousTurnId = $p end) else . end' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
   ) 2>/dev/null || echo "t3ctl: warning: could not mark dispatch $1 $2 in $LEDGER" >&2
 }
 ledger_accept() { ledger_mark "$1" accepted; }
@@ -814,7 +815,7 @@ cmd_say() {
   # uncertain, and the ledger marks the id attempted so a retry changes nothing.
   # States only move forward for an entry that was already attempted or
   # accepted: a later refusal of its replay says nothing about the first send.
-  [ -n "$REPLAY$ATTEMPTED" ] || ledger_mark "$dispatch_id" attempted
+  [ -n "$REPLAY$ATTEMPTED" ] || ledger_mark "$dispatch_id" attempted "$old"   # this send's predecessor: a refused earlier one may have reserved an older turn
   if ! mcp_raw call t3_thread_send - --retry < <(printf '%s' "$text" | jq -Rsc --arg tid "$TID" --arg rid "$dispatch_id" \
         '{threadId:$tid, message:., mode:"queue", clientRequestId:$rid}'); then
     if [ "$MCP_RC" = 2 ] && [[ $(jq -r '.code // ""' <<<"$MCP_ERR" 2>/dev/null) =~ ^(runtime_mode_escalation_denied|interaction_mode_escalation_denied|capability_denied|thread_not_found|thread_not_sendable|invalid_request|parent_not_active)$ ]]; then

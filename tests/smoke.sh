@@ -240,6 +240,15 @@ again=$("$T3CTL" say "$TID" "round 3" --dispatch-id say-replay-1 --expect-turn "
 [ "$(jq -r .messageId <<<"$again")" = "$(jq -r .messageId <<<"$first")" ] || fail "a replayed say returns the same message"
 [ "$(jq -r .previousTurnId <<<"$again")" = "$cur" ] || fail "a replayed say keeps its original predecessor: $again"
 [ "$(jq -r .previousTurnId <<<"$again")" != "$(jq -r .turnId <<<"$again")" ] || fail "a receipt never names its own run as its predecessor"
+# A refused send (stale --expect-turn) leaves its id reserved with the turn
+# it saw then; once a later retry is actually sent after another turn, the
+# ledger records that send's predecessor, so its replays report the same.
+if "$T3CTL" say "$TID" "round 4" --dispatch-id say-replay-2 --expect-turn t-stale 2>/dev/null; then fail "stale --expect-turn is refused"; fi
+moved=$("$T3CTL" say "$TID" "someone else's turn" | jq -r .turnId)
+sent=$("$T3CTL" say "$TID" "round 4" --dispatch-id say-replay-2 --expect-turn "$moved")
+[ "$(jq -r .previousTurnId <<<"$sent")" = "$moved" ] || fail "a retried send reports the turn it was sent after: $sent"
+again=$("$T3CTL" say "$TID" "round 4" --dispatch-id say-replay-2 --expect-turn "$moved")
+[ "$(jq -r .previousTurnId <<<"$again")" = "$moved" ] || fail "its replay reports the same predecessor, not the refused attempt's: $again"
 ok "say --dispatch-id replay keeps the turn it was first sent after"
 
 # ---- 2c. last / text cap ----------------------------------------------------
