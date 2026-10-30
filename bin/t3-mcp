@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""t3's orchestration MCP endpoint (POST /mcp, streamable HTTP), stdlib only.
+
+Since v0.6.0 t3ctl drives T3 through the same MCP server T3's own agents use,
+instead of the app's private WebSocket RPC. This is the transport plus the
+few compound reads t3ctl needs, normalised into the shapes t3ctl has always
+printed (latestTurn, session, hasPendingApprovals, …).
+
+  t3-mcp call TOOL [ARGS_JSON|-] [--retry]   one tool call → its structured result
+  t3-mcp probe [--require t1,t2,…]           initialize + tools/list; exit 1 if a tool is missing
+  t3-mcp thread ID [--with-error]            one thread, normalised
+  t3-mcp threads [--all-projects|--project P] [--statuses a,b] [--settled true|false]
+                 [--title-contains S] [--model Q] [--limit N] [--enrich]
+                                             normalised rows, newest first (--model: the most
+                                             recent thread using model/instance Q; --enrich:
+                                             pending-request kinds + lastError for active/failed rows)
+  t3-mcp messages ID [--runs N] [--cap C] [--with-error]
+                                             thread + recent runs + their messages, full text
+  t3-mcp run-of-message ID MESSAGE_ID        {"runId": …} the run a dispatched message started
+  t3-mcp user-inputs ID                      pending questions [{requestId, questions}]
+  t3-mcp search QUERY [--limit N]            t3_thread_search + each match's updatedAt
+  t3-mcp scopes ACCESS                       the scopes an MCP sign-in at ACCESS carries
+  t3-mcp required-tools                      the tools t3ctl calls (comma-separated)
+  t3-mcp oauth-mint --access A --client-name N  < pairing-code
+                                             headless OAuth sign-in → {"token", "expiresIn", "scope"}
+
+Env: T3CTL_URL (default http://127.0.0.1:3773), T3CTL_MCP_BEARER (an
+`mcp-client` session token; other sessions are refused by /mcp),
+T3CTL_MCP_TIMEOUT (seconds per request, default 60).
+
+Exit codes: 0 ok; 2 the tool refused (stderr: {"code", "message"}, T3's typed
+OrchestratorMcpFailure); 3 transport/auth (stderr names the HTTP status and
+error code, never the credential); 4 protocol error; 64 usage.
+"""
+from __future__ import annotations
+
+import base64
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
+import os
+import secrets
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROTOCOL = "2025-06-18"   # Effect's MCP transport answers 400 without the header after initialize
+ACTIVE = ("preparing", "queued", "starting", "running", "waiting")
+PAGE = 100                # t3_thread_list / t3_thread_read page maximum
+# Every tool t3ctl calls; `probe --t3ctl` (contract-check, token probes) fails naming any missing one.
+REQUIRED_TOOLS = ("t3_project_list", "t3_thread_list", "t3_thread_read", "t3_thread_search",
+                  "t3_thread_launch", "t3_thread_send", "t3_thread_wait", "t3_thread_configure",
+                  "t3_thread_organize", "t3_thread_interrupt", "t3_pending_request")
+ACCESS_LEVELS = ("approval-required", "auto-accept-edits", "auto", "full-access")
+MAX_CHARS = 50000         # t3_thread_read maxCharsPerItem maximum
+
+
+class ToolFailure(Exception):
+    def __init__(self, code, message):
+        super().__init__(f"{code}: {message}")
+        self.code, self.message = code, message
+
+
+class Transport(Exception):
+    pass
+
+
+class Protocol(Exception):
+    pass
+
+
+def turn_state(status):
+    """V2 run status → the turn states t3ctl has always reported."""
+    if status is None:
+        return "none"
+    if status in ACTIVE:
+        return "running"
+    if status in ("completed", "idle"):
+        return "completed"
+    if status == "failed":
+        return "error"
+    return "interrupted"
+
+
+class Mcp:
+    """One MCP session: initialize on first use, DELETE on close."""
+
+    def __init__(self, base=None, token=None, timeout=None):
+        self.base = (base or os.environ.get("T3CTL_URL", "http://127.0.0.1:3773")).rstrip("/")
+        self.token = token if token is not None else os.environ.get("T3CTL_MCP_BEARER", "")
+        if not self.token:
+            raise Transport("T3CTL_MCP_BEARER is not set")
+        self.timeout = float(timeout or os.environ.get("T3CTL_MCP_TIMEOUT", "60"))
+        self.session = None
+        self.version = None
+        self.server = None
+        self.ids = 0
+
+    # ---- wire ---------------------------------------------------------------
+    def _post(self, body, timeout=None, method="POST"):
+        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream"}
+        if self.session:
+            headers["mcp-session-id"] = self.session
+        if self.version:
+            headers["mcp-protocol-version"] = self.version
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + "/mcp", data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                self.session = resp.headers.get("mcp-session-id") or self.session
+                return resp.status, resp.headers.get("Content-Type", ""), resp.read().decode()
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")
+            try:
+                detail = json.loads(raw)
+                code = detail.get("error") or detail.get("code") or ""
+                if isinstance(code, dict):
+                    code = code.get("message", "")
+            except ValueError:
+                code = raw[:120]
+            raise Transport(f"HTTP {e.code} {code}".strip() + " from /mcp") from None
+        except (urllib.error.URLError, OSError) as e:
+            raise Transport(f"cannot reach {self.base}/mcp: {getattr(e, 'reason', e)}") from None
+
+    def _rpc(self, method, params=None, timeout=None):
+        self.ids += 1
+        rid = self.ids
+        status, ctype, raw = self._post({"jsonrpc": "2.0", "id": rid, "method": method,
+                                         **({"params": params} if params is not None else {})}, timeout)
+        for msg in _messages(ctype, raw):
+            if msg.get("id") == rid:
+                if "error" in msg:
+                    err = msg["error"]
+                    raise Protocol(f"{method}: JSON-RPC error {err.get('code')}: {err.get('message')}")
+                return msg.get("result")
+        raise Protocol(f"{method}: no response with id {rid} (HTTP {status}, {ctype or 'no content type'})")
+
+    def initialize(self):
+        if self.session is not None or self.server is not None:
+            return
+        result = self._rpc("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
+                                          "clientInfo": {"name": "t3ctl", "version": "0.6.0"}})
+        self.version = result.get("protocolVersion") or PROTOCOL
+        self.server = result.get("serverInfo") or {}
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def close(self):
+        if self.session:
+            try:
+                self._post(None, timeout=5, method="DELETE")
+            except (Transport, Protocol):
+                pass
+            self.session = None
+
+    # ---- tools --------------------------------------------------------------
+    def tools(self):
+        self.initialize()
+        names, cursor = [], None
+        while True:
+            result = self._rpc("tools/list", {"cursor": cursor} if cursor else {})
+            names += [t["name"] for t in result.get("tools", [])]
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return names
+
+    def call(self, tool, args, timeout=None, retry=False):
+        self.initialize()
+        try:
+            result = self._rpc("tools/call", {"name": tool, "arguments": args}, timeout)
+        except Transport as e:
+            # Only for calls that carry a clientRequestId: T3 derives stable
+            # command/thread/message ids from it, so a retry after a lost
+            # response returns the same durable work instead of new work. An
+            # auth refusal never reached a handler, so it is not retried here.
+            if not retry or str(e).startswith(("HTTP 401", "HTTP 403")):
+                raise
+            self.session = self.version = self.server = None
+            self.initialize()
+            result = self._rpc("tools/call", {"name": tool, "arguments": args}, timeout)
+        if result.get("isError"):
+            text = "".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+            try:
+                fail = json.loads(text)
+            except ValueError:
+                fail = {"code": "tool_error", "message": text[:1000]}
+            if not isinstance(fail, dict):
+                fail = {"code": "tool_error", "message": text[:1000]}
+            raise ToolFailure(fail.get("code", "tool_error"), fail.get("message", text[:1000]))
+        if "structuredContent" in result and result["structuredContent"] is not None:
+            return result["structuredContent"]
+        text = "".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+        try:
+            return json.loads(text)
+        except ValueError:
+            return {"text": text}
+
+
+def _messages(ctype, raw):
+    if not raw.strip():
+        return []
+    if "text/event-stream" in ctype:
+        out, data = [], []
+        for line in raw.splitlines() + [""]:
+            if line.startswith("data:"):
+                data.append(line[5:].lstrip())
+            elif not line.strip() and data:
+                try:
+                    out.append(json.loads("\n".join(data)))
+                except ValueError:
+                    pass
+                data = []
+        return out
+    try:
+        parsed = json.loads(raw)
+    except ValueError as e:
+        raise Protocol(f"unparseable /mcp response: {e}") from None
+    return parsed if isinstance(parsed, list) else [parsed]
+
+
+# ---- compound reads ---------------------------------------------------------
+
+def thread_from_detail(d):
+    status, active = d.get("status"), d.get("activeRunId")
+    latest = d.get("latestRunId")
+    return {
+        "id": d["threadId"], "title": d["title"], "projectId": d.get("projectId"),
+        "runtimeMode": d.get("runtimeMode"), "interactionMode": d.get("interactionMode") or "default",
+        "modelSelection": {"instanceId": d.get("providerInstanceId"), "model": d.get("model")},
+        "latestTurn": None if latest is None else {
+            "turnId": latest, "state": "running" if active else turn_state(status)},
+        "activeRunId": active,
+        "session": {"status": (status if status in ACTIVE else "running") if active else "idle",
+                    "lastError": None},
+        "pendingRequestCount": d.get("pendingRequestCount", 0),
+        "hasPendingApprovals": False, "hasPendingUserInput": False,
+        "settled": bool(d.get("settled")), "snoozedUntil": d.get("snoozedUntil"),
+        "archived": bool(d.get("archived")), "itemCount": d.get("itemCount", 0),
+        "parentThreadId": d.get("parentThreadId"),
+        "createdAt": d.get("createdAt"), "updatedAt": d.get("updatedAt"), "link": d.get("link"),
+    }
+
+
+def thread_from_list(t):
+    status, latest = t.get("status"), t.get("latestRunId")
+    running = status in ACTIVE
+    return {
+        "id": t["threadId"], "title": t["title"], "projectId": t.get("projectId"),
+        "runtimeMode": t.get("runtimeMode"), "interactionMode": t.get("interactionMode") or "default",
+        "modelSelection": {"instanceId": t.get("providerInstanceId"), "model": t.get("model")},
+        "latestTurn": None if latest is None else {"turnId": latest, "state": turn_state(status)},
+        "activeRunId": latest if running else None,
+        "session": {"status": status if running else "idle", "lastError": None},
+        "hasPendingApprovals": False, "hasPendingUserInput": False,
+        "settled": bool(t.get("settled")), "snoozedUntil": t.get("snoozedUntil"),
+        "archived": False, "itemCount": t.get("itemCount", 0),
+        "parentThreadId": t.get("parentThreadId"),
+        "createdAt": t.get("createdAt"), "updatedAt": t.get("updatedAt"), "link": t.get("link"),
+    }
+
+
+def detail(mcp, tid, runs=1):
+    return mcp.call("t3_thread_read", {"threadId": tid, "limit": 1, "maxCharsPerItem": 1,
+                                       "runLimit": max(1, min(runs, 50)), "afterPosition": 1 << 30})
+
+
+def add_pending(mcp, thread):
+    """Split pendingRequestCount into questions (MCP lists them) and approvals (the rest)."""
+    count = thread.get("pendingRequestCount", 0)
+    if count:
+        questions = mcp.call("t3_pending_request", {"action": "list", "threadId": thread["id"]}).get("requestIds", [])
+        thread["hasPendingUserInput"] = len(questions) > 0
+        thread["hasPendingApprovals"] = count > len(questions)
+    return thread
+
+
+def add_last_error(mcp, thread):
+    """lastError = the latest run's error item; MCP has no lastError field."""
+    turn = thread.get("latestTurn") or {}
+    if turn.get("state") not in ("error", "interrupted"):
+        return thread
+    for item in reversed(scan(mcp, thread["id"], thread.get("itemCount", 0), "activity",
+                              lambda items: any(i.get("type") == "error" or i.get("runId") != turn["turnId"] for i in items),
+                              cap=2000)):
+        if item.get("runId") != turn["turnId"]:
+            break
+        if item.get("type") == "error":
+            thread["session"]["lastError"] = item.get("text")
+            break
+    return thread
+
+
+def full_thread(mcp, tid, with_error=False):
+    d = detail(mcp, tid)
+    thread = add_pending(mcp, thread_from_detail(d["thread"]))
+    thread["recentRuns"] = d.get("recentRuns", [])
+    return add_last_error(mcp, thread) if with_error else thread
+
+
+def scan(mcp, tid, item_count, view, enough, cap=0, window=200):
+    """Tail of a thread's timeline: widen the window until enough(items) or position 0.
+
+    t3_thread_read pages forward from afterPosition; the tail is what t3ctl
+    reads (latest reply, latest turns), so start near itemCount and widen.
+    """
+    while True:
+        after = max(-1, item_count - window - 1)
+        items, pos = [], after
+        while True:
+            args = {"threadId": tid, "view": view, "limit": PAGE,
+                    "maxCharsPerItem": cap if 0 < cap <= MAX_CHARS else MAX_CHARS}
+            if pos >= 0:   # the schema has no -1: omitting it reads from the start
+                args["afterPosition"] = pos
+            page = mcp.call("t3_thread_read", args)
+            items += page.get("items", [])
+            if not page.get("hasMore") or page.get("nextPosition") is None or page["nextPosition"] <= pos:
+                break
+            pos = page["nextPosition"]
+        done = enough(items)   # always called: callers collect through it
+        if done or after < 0:
+            return items
+        window *= 4
+
+
+def complete_text(mcp, tid, item):
+    """Follow textOffset continuations so an agent gets the whole reply."""
+    text = item.get("text") or ""
+    while item.get("textTruncated") and item.get("nextTextOffset") is not None:
+        item = mcp.call("t3_thread_read", {"threadId": tid, "itemId": item["itemId"],
+                                           "textOffset": item["nextTextOffset"], "maxCharsPerItem": MAX_CHARS})
+        item = (item.get("items") or [{}])[0]
+        text += item.get("text") or ""
+    return text
+
+
+def messages(mcp, tid, runs=4, cap=0, with_error=False):
+    runs = runs or 50   # v0.5.0's jq `.[-0:]` made -n 0 mean every turn; 50 is MCP's runLimit maximum
+    d = detail(mcp, tid, runs)
+    thread = add_pending(mcp, thread_from_detail(d["thread"]))
+    recent = [r["runId"] for r in sorted(d.get("recentRuns", []), key=lambda r: r["ordinal"])][-runs:] if runs else []
+    wanted = set(recent)
+
+    def enough(items):
+        msgs = [i for i in items if i.get("type") in ("user_message", "assistant_message")]
+        return bool(msgs) and msgs[0].get("runId") not in wanted
+
+    items = scan(mcp, tid, thread["itemCount"], "messages", enough,
+                 cap=(cap + 1) if cap else 0) if wanted else []
+    out = []
+    for i in items:
+        if i.get("type") not in ("user_message", "assistant_message"):
+            continue
+        if i.get("runId") is not None and i["runId"] not in wanted:
+            continue
+        text = complete_text(mcp, tid, i) if not cap else (i.get("text") or "")
+        out.append({"id": i.get("messageId") or i.get("itemId"),
+                    "role": "user" if i["type"] == "user_message" else "assistant",
+                    "text": text, "createdAt": i.get("updatedAt"), "runId": i.get("runId")})
+    if with_error:
+        add_last_error(mcp, thread)
+    latest = thread["latestTurn"]
+    if latest is not None:
+        latest["userMessageId"] = next((m["id"] for m in out if m["role"] == "user" and m["runId"] == latest["turnId"]), None)
+    return {"thread": thread,
+            "runs": [{"id": r["runId"], "status": r["status"], "ordinal": r["ordinal"]}
+                     for r in sorted(d.get("recentRuns", []), key=lambda r: r["ordinal"])],
+            "messages": out}
+
+
+def run_of_message(mcp, tid, message_id):
+    d = detail(mcp, tid)
+    found = []
+
+    def enough(items):
+        found[:] = [i for i in items if i.get("type") == "user_message" and i.get("messageId") == message_id]
+        return bool(found)
+
+    scan(mcp, tid, d["thread"].get("itemCount", 0), "messages", enough, cap=1)
+    runs = {i.get("runId") for i in found if i.get("runId")}
+    if len(runs) > 1:
+        raise ToolFailure("ambiguous", "message maps to several runs")
+    return {"runId": runs.pop() if runs else None}
+
+
+def search(mcp, query, limit):
+    """t3_thread_search, plus each match's updatedAt (search results carry none)."""
+    matches = mcp.call("t3_thread_search", {"query": query, "limit": max(1, min(limit, 50))}).get("matches", [])
+
+    def updated(tid):
+        m = Mcp(mcp.base, mcp.token, mcp.timeout)
+        try:
+            return tid, detail(m, tid)["thread"].get("updatedAt")
+        except ToolFailure:
+            return tid, None
+        finally:
+            m.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        stamps = dict(pool.map(updated, sorted({m["threadId"] for m in matches})))
+    return [{**m, "updatedAt": stamps.get(m["threadId"])} for m in matches]
+
+
+def scopes(access):
+    """The scopes T3 grants an MCP client at an access level (contracts mcpClientScopes);
+    a pairing code that approves the sign-in must carry all of them."""
+    if access == "read-only":
+        return ["orchestration:read"]
+    if access == "full-access":
+        return ["orchestration:read", "orchestration:operate", "settings:write", "source-control:write"]
+    return ["orchestration:read", "orchestration:operate"]
+
+
+def user_inputs(mcp, tid):
+    ids = mcp.call("t3_pending_request", {"action": "list", "threadId": tid}).get("requestIds", [])
+    out = []
+    for rid in ids:
+        try:
+            q = mcp.call("t3_pending_request", {"action": "read", "threadId": tid, "requestId": rid})
+        except ToolFailure:
+            continue   # answered between list and read
+        out.append({"requestId": rid, "questions": q.get("questions", [])})
+    return out
+
+
+def threads(mcp, opts):
+    args = {"limit": PAGE}
+    if opts.get("project"):
+        args["projectId"] = opts["project"]
+    else:
+        args["allProjects"] = True
+    for key in ("statuses", "settled", "titleContains"):
+        if opts.get(key) is not None:
+            args[key] = opts[key]
+    limit = opts.get("limit")
+    model = opts.get("model")
+    first = mcp.call("t3_thread_list", {**args, "cursor": 0})
+    rows = list(first.get("threads", []))
+
+    def matches(t):
+        sel_model, inst = t.get("model"), t.get("providerInstanceId")
+        return model in (sel_model, inst, f"{inst}:{sel_model or ''}")
+
+    if model is not None:
+        # newest first, so the first page holding a match holds the most recent one
+        cursor = first.get("nextCursor")
+        while not any(matches(t) for t in rows) and cursor is not None:
+            page = mcp.call("t3_thread_list", {**args, "cursor": cursor})
+            rows = page.get("threads", [])
+            cursor = page.get("nextCursor")
+        rows = [t for t in rows if matches(t)][:1]
+    elif first.get("nextCursor") is not None and (limit is None or len(rows) < limit):
+        total = first.get("total") or 0
+        cursors = list(range(first["nextCursor"], total, PAGE))
+        if limit is not None:
+            cursors = [c for c in cursors if c < limit]
+        # Each page re-reads the server's whole shell, so fetch the rest in
+        # parallel; the order can shift between pages, hence the de-dupe.
+        def page(cursor):
+            m = Mcp(mcp.base, mcp.token, mcp.timeout)
+            try:
+                return m.call("t3_thread_list", {**args, "cursor": cursor})
+            finally:
+                m.close()
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for result in pool.map(page, cursors):
+                rows += result.get("threads", [])
+    seen, out = set(), []
+    for t in rows:
+        if t["threadId"] not in seen:
+            seen.add(t["threadId"])
+            out.append(thread_from_list(t))
+    out.sort(key=lambda t: t.get("updatedAt") or "", reverse=True)
+    if limit is not None:
+        out = out[:limit]
+    if opts.get("enrich"):
+        def enrich(t):
+            m = Mcp(mcp.base, mcp.token, mcp.timeout)
+            try:
+                if t["session"]["status"] in ACTIVE:
+                    d = detail(m, t["id"])["thread"]
+                    t["pendingRequestCount"] = d.get("pendingRequestCount", 0)
+                    t["activeRunId"] = d.get("activeRunId")
+                    add_pending(m, t)
+                if (t["latestTurn"] or {}).get("state") == "error":
+                    add_last_error(m, t)
+            except ToolFailure:
+                pass   # deleted between list and read
+            finally:
+                m.close()
+            return t
+        todo = [t for t in out if t["session"]["status"] in ACTIVE or (t["latestTurn"] or {}).get("state") == "error"]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(enrich, todo))
+    return out
+
+
+# ---- OAuth (credential minting) ---------------------------------------------
+
+def oauth_mint(base, access, client_name, pairing_code):
+    """Sign in to /mcp the way an outside agent does, headless.
+
+    A CLI-issued `mcp-client` session with orchestration:operate carries no
+    runtime-mode ceiling, which T3 treats as approval-required: such a token
+    cannot start or message a full-access thread. A ceiling is only granted
+    through the OAuth approval, which a one-time pairing code can make.
+    """
+    base = base.rstrip("/")
+
+    def post(path, payload, form=False):
+        data = urllib.parse.urlencode(payload).encode() if form else json.dumps(payload).encode()
+        ctype = "application/x-www-form-urlencoded" if form else "application/json"
+        req = urllib.request.Request(base + path, data=data, headers={"Content-Type": ctype, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")
+            try:
+                d = json.loads(raw)
+                msg = d.get("error_description") or d.get("message") or d.get("error") or raw[:200]
+            except ValueError:
+                msg = raw[:200]
+            raise Transport(f"HTTP {e.code} from {path}: {msg}") from None
+        except (urllib.error.URLError, OSError) as e:
+            raise Transport(f"cannot reach {base}{path}: {getattr(e, 'reason', e)}") from None
+
+    redirect = "http://127.0.0.1/t3ctl-oauth-callback"   # loopback; never contacted
+    client = post("/oauth/mcp/register", {"client_name": client_name, "redirect_uris": [redirect],
+                                          "token_endpoint_auth_method": "none"})
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    state = secrets.token_urlsafe(12)
+    authorization = {"response_type": "code", "client_id": client["client_id"], "redirect_uri": redirect,
+                     "code_challenge": challenge, "code_challenge_method": "S256", "state": state,
+                     "resource": base + "/mcp"}
+    decision = post("/oauth/mcp/decision", {"authorization": authorization,
+                                            "decision": {"_tag": "pairing-code", "access": access, "code": pairing_code}})
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(decision.get("redirectTo", "")).query)
+    if "error" in query:
+        raise Transport(f"sign-in refused: {query['error'][0]} {query.get('error_description', [''])[0]}")
+    if query.get("state", [""])[0] != state or not query.get("code"):
+        raise Protocol("sign-in returned no authorization code")
+    token = post("/oauth/mcp/token", {"grant_type": "authorization_code", "code": query["code"][0],
+                                      "redirect_uri": redirect, "client_id": client["client_id"],
+                                      "code_verifier": verifier, "resource": base + "/mcp"}, form=True)
+    if not token.get("access_token"):
+        raise Protocol("token endpoint returned no access_token")
+    return {"token": token["access_token"], "expiresIn": token.get("expires_in"), "scope": token.get("scope")}
+
+
+# ---- CLI --------------------------------------------------------------------
+
+def _flags(argv, spec):
+    """Tiny flag parser: spec maps --flag → (key, takes_value)."""
+    out, rest, i = {}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in spec:
+            key, takes = spec[a]
+            if takes:
+                if i + 1 >= len(argv):
+                    raise SystemExit(_usage(f"{a} needs a value"))
+                out[key] = argv[i + 1]
+                i += 2
+                continue
+            out[key] = True
+        else:
+            rest.append(a)
+        i += 1
+    return out, rest
+
+
+def _usage(msg):
+    print(f"t3-mcp: {msg}", file=sys.stderr)
+    return 64
+
+
+def main(argv):
+    if not argv:
+        return _usage("usage: see the module docstring")
+    cmd, argv = argv[0], argv[1:]
+    if cmd == "scopes":
+        if not argv or argv[0] not in ACCESS_LEVELS + ("read-only",):
+            return _usage("usage: t3-mcp scopes ACCESS")
+        print(" ".join(scopes(argv[0])))
+        return 0
+    if cmd == "required-tools":
+        print(",".join(REQUIRED_TOOLS))
+        return 0
+    if cmd == "oauth-mint":
+        f, _ = _flags(argv, {"--access": ("access", True), "--client-name": ("name", True)})
+        code = sys.stdin.read().strip()
+        if not code or "access" not in f or "name" not in f:
+            return _usage("usage: t3-mcp oauth-mint --access A --client-name N < pairing-code")
+        print(json.dumps(oauth_mint(os.environ.get("T3CTL_URL", "http://127.0.0.1:3773"), f["access"], f["name"], code)))
+        return 0
+    mcp = Mcp()
+    try:
+        if cmd == "call":
+            f, rest = _flags(argv, {"--retry": ("retry", False), "--timeout": ("timeout", True)})
+            if not rest:
+                return _usage("usage: t3-mcp call TOOL [ARGS_JSON|-]")
+            raw = rest[1] if len(rest) > 1 else "{}"
+            args = json.loads(sys.stdin.read() if raw == "-" else raw)
+            out = mcp.call(rest[0], args, timeout=float(f["timeout"]) if "timeout" in f else None, retry=bool(f.get("retry")))
+        elif cmd == "probe":
+            f, _ = _flags(argv, {"--require": ("require", True), "--t3ctl": ("t3ctl", False)})
+            names = mcp.tools()
+            need = list(REQUIRED_TOOLS) if f.get("t3ctl") else []
+            need += [t for t in f.get("require", "").split(",") if t and t not in need]
+            missing = [t for t in need if t not in names]
+            print(json.dumps({"serverInfo": mcp.server, "protocolVersion": mcp.version, "tools": len(names),
+                              "required": len(need), "missing": missing}))
+            return 1 if missing else 0
+        elif cmd == "thread":
+            f, rest = _flags(argv, {"--with-error": ("err", False)})
+            out = full_thread(mcp, rest[0], bool(f.get("err")))
+        elif cmd == "threads":
+            f, _ = _flags(argv, {"--all-projects": ("all", False), "--project": ("project", True),
+                                 "--statuses": ("statuses", True), "--settled": ("settled", True),
+                                 "--title-contains": ("titleContains", True), "--limit": ("limit", True),
+                                 "--model": ("model", True), "--enrich": ("enrich", False)})
+            if "statuses" in f:
+                f["statuses"] = [s for s in f["statuses"].split(",") if s]
+            if "settled" in f:
+                f["settled"] = f["settled"] == "true"
+            if "limit" in f:
+                f["limit"] = int(f["limit"])
+            out = threads(mcp, f)
+        elif cmd == "messages":
+            f, rest = _flags(argv, {"--runs": ("runs", True), "--cap": ("cap", True), "--with-error": ("err", False)})
+            out = messages(mcp, rest[0], int(f.get("runs", 4)), int(f.get("cap", 0)), bool(f.get("err")))
+        elif cmd == "search":
+            f, rest = _flags(argv, {"--limit": ("limit", True)})
+            out = search(mcp, rest[0], int(f.get("limit", 20)))
+        elif cmd == "run-of-message":
+            out = run_of_message(mcp, argv[0], argv[1])
+        elif cmd == "user-inputs":
+            out = user_inputs(mcp, argv[0])
+        else:
+            return _usage(f"unknown command {cmd}")
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    except ToolFailure as e:
+        print(json.dumps({"code": e.code, "message": e.message}), file=sys.stderr)
+        return 2
+    except Transport as e:
+        print(f"t3-mcp: {e}", file=sys.stderr)
+        return 3
+    except Protocol as e:
+        print(f"t3-mcp: {e}", file=sys.stderr)
+        return 4
+    except (IndexError, ValueError) as e:
+        return _usage(f"bad arguments: {e}")
+    finally:
+        mcp.close()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Transport as e:
+        print(f"t3-mcp: {e}", file=sys.stderr)
+        sys.exit(3)
+    except Protocol as e:
+        print(f"t3-mcp: {e}", file=sys.stderr)
+        sys.exit(4)
