@@ -362,6 +362,35 @@ class TransportTest(unittest.TestCase):
         out = self.cli('contract-check', success=False)
         self.assertIn("lacks tools t3ctl calls: t3_thread_wait, t3_pending_request", out.stderr)
 
+    def test_an_idle_thread_waiting_on_a_question_is_active(self):
+        # found live: a question can outlive its run; v0.5.0 listed it, the MCP status filter cannot see it
+        self.thread['requests'] = [self.request()]
+        rows = [json.loads(l) for l in subprocess.run(['bash', CLI, 'list', '--active'], text=True, capture_output=True,
+                                                      env=self.env, timeout=25).stdout.splitlines()]
+        self.assertEqual([(r['id'], r['turn'], r['pendingUserInput']) for r in rows], [('test-thread', 'completed', True)])
+
+    def test_runless_v1_thread_shows_its_messages(self):
+        self.thread['runs'] = []
+        self.thread['messages'] = [{'role': 'user', 'text': 'v1 question', 'runId': None},
+                                   {'role': 'assistant', 'text': 'v1 answer', 'runId': None}]
+        self.assertEqual([m['text'] for m in self.cli('show', 'test-thread')['messages']], ['v1 question', 'v1 answer'])
+        out = self.cli('last', 'test-thread', '--json')
+        self.assertEqual((out['text'], out['turn'], out['turnId']), ('v1 answer', 'none', None))
+
+    def test_turns_cancelled_before_starting_do_not_count(self):
+        self.thread['runs'] = [{'id': 'r1', 'status': 'completed'}, {'id': 'r2', 'status': 'completed'},
+                               {'id': 'r3', 'status': 'cancelled', 'neverStarted': True}]
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'first', 'runId': 'r1'},
+                                   {'role': 'assistant', 'text': 'second', 'runId': 'r2'}]
+        self.assertEqual([m['text'] for m in self.cli('show', 'test-thread', '-n', '2')['messages']], ['first', 'second'])
+
+    def test_legacy_path_encodes_thread_ids(self):
+        tid = 'thread:delegated-task:command%3Amcp%3Ax'   # T3 puts % in delegated-task thread ids
+        self.server.state.threads[tid] = self.server.state.threads.pop('test-thread')
+        self.thread['id'] = tid
+        self.thread['requests'] = [{'id': 'r1', 'kind': 'command', 'status': 'pending', 'runId': 'old', 'command': 'ls'}]
+        self.assertEqual(self.cli('show', tid)['approvals'][0]['payload']['detail'], 'ls')
+
     def test_prefix_resolution_and_say_idempotency(self):
         out = self.cli('say', 'test-th', 'hello', '--dispatch-id', 'retry-key-0001')
         again = self.cli('say', 'test-thread', 'hello', '--dispatch-id', 'retry-key-0001')

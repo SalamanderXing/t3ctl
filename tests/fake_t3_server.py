@@ -40,7 +40,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_t3_mcp  # noqa: E402
@@ -294,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         prefix, suffix = "/api/orchestration/threads/", "/bounded"
         if url.path.startswith(prefix) and url.path.endswith(suffix):
-            t = state.threads.get(url.path[len(prefix):-len(suffix)])
+            t = state.threads.get(unquote(url.path[len(prefix):-len(suffix)]))   # decoded, like T3
             if t is None:
                 self._json(404, {"error": "no such thread"})
                 return

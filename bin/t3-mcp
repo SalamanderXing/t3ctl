@@ -13,7 +13,8 @@ printed (latestTurn, session, hasPendingApprovals, …).
                  [--title-contains S] [--model Q] [--limit N] [--enrich]
                                              normalised rows, newest first (--model: the most
                                              recent thread using model/instance Q; --enrich:
-                                             pending-request kinds + lastError for active/failed rows)
+                                             pending-request kinds + lastError; --attention:
+                                             running or waiting on a request, for list --active)
   t3-mcp messages ID [--runs N] [--cap C] [--with-error]
                                              thread + recent runs + their messages, full text
   t3-mcp run-of-message ID MESSAGE_ID        {"runId": …} the run a dispatched message started
@@ -54,6 +55,7 @@ REQUIRED_TOOLS = ("t3_project_list", "t3_thread_list", "t3_thread_read", "t3_thr
                   "t3_thread_organize", "t3_thread_interrupt", "t3_pending_request")
 ACCESS_LEVELS = ("approval-required", "auto-accept-edits", "auto", "full-access")
 MAX_CHARS = 50000         # t3_thread_read maxCharsPerItem maximum
+RUNLESS_WINDOW = 100      # V1-imported messages (no run) shown from the last N timeline items
 
 
 class ToolFailure(Exception):
@@ -336,22 +338,30 @@ def complete_text(mcp, tid, item):
 
 def messages(mcp, tid, runs=4, cap=0, with_error=False):
     runs = runs or 50   # v0.5.0's jq `.[-0:]` made -n 0 mean every turn; 50 is MCP's runLimit maximum
-    d = detail(mcp, tid, runs)
+    d = detail(mcp, tid, runs + 10)
     thread = add_pending(mcp, thread_from_detail(d["thread"]))
-    recent = [r["runId"] for r in sorted(d.get("recentRuns", []), key=lambda r: r["ordinal"])][-runs:] if runs else []
-    wanted = set(recent)
+    # A queued run cancelled before it started has no messages and was never
+    # in v0.5.0's bounded snapshot: it does not count as one of the last N turns.
+    started = [r for r in sorted(d.get("recentRuns", []), key=lambda r: r["ordinal"])
+               if r.get("startedAt") is not None or r.get("status") != "cancelled"]
+    wanted = {r["runId"] for r in started[-runs:]}
+    oldest_runless = thread["itemCount"] - RUNLESS_WINDOW
 
     def enough(items):
         msgs = [i for i in items if i.get("type") in ("user_message", "assistant_message")]
         return bool(msgs) and msgs[0].get("runId") not in wanted
 
-    items = scan(mcp, tid, thread["itemCount"], "messages", enough,
-                 cap=(cap + 1) if cap else 0) if wanted else []
+    # Threads imported from V1 have no runs and their messages no runId; like
+    # v0.5.0 (which read a bounded recent window) they show the tail window.
+    items = scan(mcp, tid, thread["itemCount"], "messages", enough if wanted else (lambda items: True),
+                 cap=(cap + 1) if cap else 0, window=200 if wanted else RUNLESS_WINDOW)
     out = []
     for i in items:
         if i.get("type") not in ("user_message", "assistant_message"):
             continue
         if i.get("runId") is not None and i["runId"] not in wanted:
+            continue
+        if i.get("runId") is None and i.get("position", 0) < oldest_runless:
             continue
         text = complete_text(mcp, tid, i) if not cap else (i.get("text") or "")
         out.append({"id": i.get("messageId") or i.get("itemId"),
@@ -423,6 +433,19 @@ def user_inputs(mcp, tid):
     return out
 
 
+def attention(mcp, opts):
+    """`list --active`: running threads plus those waiting on a request. MCP's
+    status filter only sees runs, and a question can outlive its run, so the
+    unsettled threads (where every pending request lives) are checked too."""
+    base = {k: v for k, v in opts.items() if k not in ("attention", "statuses", "settled")}
+    rows = {t["id"]: t for t in threads(mcp, {**base, "statuses": list(ACTIVE), "enrich": True})}
+    for t in threads(mcp, {**base, "settled": False, "enrich": True}):
+        rows.setdefault(t["id"], t)
+    out = [t for t in rows.values()
+           if t["session"]["status"] in ACTIVE or t["hasPendingApprovals"] or t["hasPendingUserInput"]]
+    return sorted(out, key=lambda t: t.get("updatedAt") or "", reverse=True)
+
+
 def threads(mcp, opts):
     args = {"limit": PAGE}
     if opts.get("project"):
@@ -477,7 +500,7 @@ def threads(mcp, opts):
         def enrich(t):
             m = Mcp(mcp.base, mcp.token, mcp.timeout)
             try:
-                if t["session"]["status"] in ACTIVE:
+                if not t["settled"] or t["session"]["status"] in ACTIVE:
                     d = detail(m, t["id"])["thread"]
                     t["pendingRequestCount"] = d.get("pendingRequestCount", 0)
                     t["activeRunId"] = d.get("activeRunId")
@@ -489,7 +512,11 @@ def threads(mcp, opts):
             finally:
                 m.close()
             return t
-        todo = [t for t in out if t["session"]["status"] in ACTIVE or (t["latestTurn"] or {}).get("state") == "error"]
+        # A pending request can outlive its run (an idle thread still waiting on a
+        # question), and T3 refuses to settle a thread with one, so every
+        # unsettled row is checked; settled ones only for lastError.
+        todo = [t for t in out if not t["settled"] or t["session"]["status"] in ACTIVE
+                or (t["latestTurn"] or {}).get("state") == "error"]
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(enrich, todo))
     return out
@@ -620,14 +647,15 @@ def main(argv):
             f, _ = _flags(argv, {"--all-projects": ("all", False), "--project": ("project", True),
                                  "--statuses": ("statuses", True), "--settled": ("settled", True),
                                  "--title-contains": ("titleContains", True), "--limit": ("limit", True),
-                                 "--model": ("model", True), "--enrich": ("enrich", False)})
+                                 "--model": ("model", True), "--enrich": ("enrich", False),
+                                 "--attention": ("attention", False)})
             if "statuses" in f:
                 f["statuses"] = [s for s in f["statuses"].split(",") if s]
             if "settled" in f:
                 f["settled"] = f["settled"] == "true"
             if "limit" in f:
                 f["limit"] = int(f["limit"])
-            out = threads(mcp, f)
+            out = attention(mcp, f) if f.get("attention") else threads(mcp, f)
         elif cmd == "messages":
             f, rest = _flags(argv, {"--runs": ("runs", True), "--cap": ("cap", True), "--with-error": ("err", False)})
             out = messages(mcp, rest[0], int(f.get("runs", 4)), int(f.get("cap", 0)), bool(f.get("err")))

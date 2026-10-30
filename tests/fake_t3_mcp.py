@@ -200,7 +200,8 @@ def _call(state, name, args, access, namespace):
             text = i.get("text") or ""
             if len(text) > cap:
                 i["text"], i["textTruncated"], i["nextTextOffset"] = text[:cap], True, base + cap
-        runs = [{"runId": r["id"], "ordinal": n + 1, "status": r["status"]} for n, r in enumerate(t["runs"])]
+        runs = [{"runId": r["id"], "ordinal": n + 1, "status": r["status"],
+                 "startedAt": None if r.get("neverStarted") else "2026-09-08T10:00:00.000Z"} for n, r in enumerate(t["runs"])]
         more = not args.get("itemId") and len(items) > len(pages)
         return {"thread": detail(t), "recentRuns": runs[-args.get("runLimit", 5):],
                 "items": pages, "nextPosition": pages[-1]["position"] if pages else None, "hasMore": more}

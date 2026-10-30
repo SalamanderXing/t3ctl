@@ -461,7 +461,7 @@ cmd_list() {
     all) legacy_list_all; return;;   # MCP's t3_thread_list has no archived threads
     unsettled) rows=$(mcp threads --all-projects --settled false --enrich) || exit 1;;
     unarchived) rows=$(mcp threads --all-projects --enrich) || exit 1;;
-    active) rows=$(mcp threads --all-projects --statuses "$ACTIVE_STATUSES" --enrich) || exit 1;;
+    active) rows=$(mcp threads --all-projects --attention) || exit 1;;
   esac
   load_projects
   jq -c --arg f "$filter" --argjson ps "$PROJECTS" '

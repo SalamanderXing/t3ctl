@@ -127,8 +127,9 @@ DETAIL_NORM=$TURN_STATE'
                      detail: (if .nativeItemRef.nativeId == null then null else $cmds[.nativeItemRef.nativeId] end),
                      decision: ($q.decision // null)}}],
       providerSessions: [$p.providerSessions[] | {id, status}]})}'
+uri() { jq -rn --arg s "$1" '$s | @uri'; }   # thread ids can hold %, : and / (delegated-task threads)
 legacy_thread_detail() { # $1 thread id
-  api GET "/api/orchestration/threads/$1/bounded" | jq -c "$DETAIL_NORM"
+  api GET "/api/orchestration/threads/$(uri "$1")/bounded" | jq -c "$DETAIL_NORM"
 }
 
 # ---- what MCP cannot do --------------------------------------------------------
@@ -311,7 +312,7 @@ legacy_contract_check() { # → JSON fragment for contract-check; dies on a brok
     jq -e '.threads[0] | has("latestRunId") and has("activeRunId") and has("status") and has("pendingRuntimeRequest")
              and has("runtimeMode") and has("settledOverride") and has("archivedAt")' >/dev/null <<<"$raw" \
       || die "V2 thread shell fields changed (latestRunId/activeRunId/status/pendingRuntimeRequest/…)"
-    api GET "/api/orchestration/threads/$tid/bounded" | jq -e '.projection
+    api GET "/api/orchestration/threads/$(uri "$tid")/bounded" | jq -e '.projection
         | (.runs | type == "array") and (.runtimeRequests | type == "array") and (.messages | type == "array")
           and (.turnItems | type == "array") and (.providerSessions | type == "array") and (.thread | has("runtimeMode"))' >/dev/null \
       || die "V2 bounded thread snapshot shape changed"
