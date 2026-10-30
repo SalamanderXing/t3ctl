@@ -490,6 +490,17 @@ class TransportTest(unittest.TestCase):
             out = self.cli('say', 'test-thread', 'Go', '--mode', 'auto', '--execute', '--dispatch-id', 'uncertain-0001', success=False)
         self.assertEqual((self.thread['runtimeMode'], self.thread['interactionMode']), ('approval-required', 'plan'))
 
+    def test_a_refused_replay_keeps_the_entry_accepted(self):
+        self.cli('say', 'test-thread', 'A', '--mode', 'auto', '--execute', '--model', 'codex:model-a', '--dispatch-id', 'keep-acc-0001')
+        self.cli('say', 'test-thread', 'B', '--mode', 'approval-required', '--plan', '--model', 'codex:model-b')
+        self.thread['archivedAt'] = '2026-09-08T00:00:00.000Z'   # replay refused before T3 de-duplicates
+        self.cli('say', 'test-thread', 'A', '--mode', 'auto', '--execute', '--model', 'codex:model-a', '--dispatch-id', 'keep-acc-0001', success=False)
+        self.thread['archivedAt'] = None
+        self.cli('say', 'test-thread', 'A', '--mode', 'auto', '--execute', '--model', 'codex:model-a', '--dispatch-id', 'keep-acc-0001')
+        self.assertEqual((self.thread['runtimeMode'], self.thread['interactionMode'], self.thread['modelSelection']['model']),
+                         ('approval-required', 'plan', 'model-b'))
+        self.assertEqual(len(self.sent('mcp.t3_thread_send')), 2)
+
     def test_a_refused_dispatch_is_not_a_replay(self):
         self.thread['archivedAt'] = '2026-09-08T00:00:00.000Z'      # T3 refuses the send: thread_not_sendable
         self.cli('say', 'test-thread', 'x', '--expect-turn', 'old', '--dispatch-id', 'refused-key-01', success=False)

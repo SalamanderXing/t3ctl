@@ -698,7 +698,7 @@ Callback contract (from the dispatcher, not the task): this t3 thread's id is $t
 Run it as a plain command exactly in that form (double-quoted summary, no other shell syntax): that exact command is pre-approved and runs without a prompt even in approval-required mode. Notify on those state changes only — not for progress updates. Also: never schedule recurring jobs (cron, timers, self-reminders) from inside this session; they die with it. If the work needs something recurring, say so in your callback and it will be scheduled properly outside."
   fi
   local sent state
-  ledger_mark "$dispatch_id" attempted
+  [ -n "$REPLAY$ATTEMPTED" ] || ledger_mark "$dispatch_id" attempted
   sent=$(send_message "$tid" "$prompt" "$dispatch_id") || exit 1
   ledger_accept "$dispatch_id"
   state=$(turn_of "$(jq -r 'if .runId == null then "" else .status end' <<<"$sent")")
@@ -800,11 +800,13 @@ cmd_say() {
   # reply, orchestration_error, which T3 can return after dispatching) it may
   # be running: the requested settings stay, the caller is told delivery is
   # uncertain, and the ledger marks the id attempted so a retry changes nothing.
-  ledger_mark "$dispatch_id" attempted
+  # States only move forward for an entry that was already attempted or
+  # accepted: a later refusal of its replay says nothing about the first send.
+  [ -n "$REPLAY$ATTEMPTED" ] || ledger_mark "$dispatch_id" attempted
   if ! mcp_raw call t3_thread_send - --retry < <(printf '%s' "$text" | jq -Rsc --arg tid "$TID" --arg rid "$dispatch_id" \
         '{threadId:$tid, message:., mode:"queue", clientRequestId:$rid}'); then
     if [ "$MCP_RC" = 2 ] && [[ $(jq -r '.code // ""' <<<"$MCP_ERR" 2>/dev/null) =~ ^(runtime_mode_escalation_denied|interaction_mode_escalation_denied|capability_denied|thread_not_found|thread_not_sendable|invalid_request|parent_not_active)$ ]]; then
-      ledger_mark "$dispatch_id" reserved   # refused outright: nothing of it exists
+      [ -n "$REPLAY$ATTEMPTED" ] || ledger_mark "$dispatch_id" reserved   # refused outright: nothing of it exists
       local send_rc=$MCP_RC send_err=$MCP_ERR   # say_restore's own calls overwrite them
       say_restore; MCP_RC=$send_rc; MCP_ERR=$send_err; mcp_fail t3_thread_send
     fi

@@ -143,3 +143,26 @@ likely to:
    snapshot's `runs`/`runtimeRequests`/`turnItems`/`messages`.
 5. `t3-events`' SQL on `orchestration_v2_projection_runs`
    (`json_extract(payload_json, '$.userMessageId')`).
+
+## Known limits (v0.6.0)
+
+- Dispatch ledger: a `--dispatch-id` older than the 35-day retention is
+  treated as new; a failed ledger update leaves an entry at an earlier state;
+  an `attempted` dispatch whose send was in fact accepted (uncertain
+  delivery) cannot be recovered with its original `--expect-turn` — the
+  stale-turn guard refuses, so read the thread (`t3ctl last`) instead.
+- `watch` notices a pending approval/question at the next
+  `T3CTL_WATCH_SLICE` boundary (≤ 15 s): `t3_thread_wait` ends only on a
+  terminal run.
+- `list --unarchived` (~10–15 s) and `models` (~7 s) on a 1500-thread box:
+  MCP pages 100 threads at a time and every page re-reads the shell.
+- The MCP credential's TTL is T3's fixed 30 d for OAuth sign-ins
+  (`T3CTL_TOKEN_TTL` applies to the legacy token only). Its session id is found
+  by its unique client label in `auth session list`; if that fails, the
+  rotation warns and that session expires by TTL instead of being revoked.
+- At a full-access ceiling T3 adds `settings:write` and
+  `source-control:write` to the MCP credential (server policy; usable on
+  `/mcp` only).
+- The pairing-code approval (`/oauth/mcp/decision`) is an app API used
+  headless: if T3 changes it, rotation fails loudly (alert) and the working
+  token stays until it expires.
