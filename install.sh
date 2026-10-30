@@ -2,7 +2,7 @@
 # install.sh — install the t3ctl tooling on a devbox. Idempotent; run as root
 # from a checkout (or an archive) of this repo at a tagged version.
 #
-#   bin/*        -> /usr/local/bin/{t3ctl,t3-token-renew,t3-notify}
+#   bin/*        -> /usr/local/bin/{t3ctl,t3ctl-legacy.sh,t3-mcp,t3-rpc,t3-events,t3-token-renew,t3-notify}
 #                   (+ a symlink named $T3CTL_NOTIFY_BIN if it differs)
 #   units/*      -> /etc/systemd/system/  (token renew timer, callback approver)
 #   skills/      -> /usr/local/share/t3ctl/skills   (add to hermes config:
@@ -28,7 +28,7 @@ put() { # put SRC DEST MODE
   install -D -m "$3" "$1" "$2"; echo "wrote    $2"; changed+=("$2")
 }
 
-for f in "$SRC"/bin/*; do put "$f" "/usr/local/bin/$(basename "$f")" 0755; done
+for f in "$SRC"/bin/*; do [ -f "$f" ] || continue; put "$f" "/usr/local/bin/$(basename "$f")" 0755; done   # skips __pycache__
 for f in "$SRC"/units/*; do put "$f" "/etc/systemd/system/$(basename "$f")" 0644; done
 while IFS= read -r f; do
   put "$f" "$SHARE/skills/${f#"$SRC"/skills/}" 0644

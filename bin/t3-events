@@ -4,12 +4,24 @@
 The CLI registers dispatch receipts. One gateway watcher observes T3's typed
 state, writes an outbox, and uses Hermes' existing session notification path.
 No model invocation or agent-authored callback is needed to detect completion.
+
+State reads: the gateway's poll goes through `t3ctl watch`, which since
+v0.6.0 reads T3's MCP endpoint (t3_thread_read / t3_thread_wait; the user
+message item records the run it started, the same authoritative
+message → run mapping the SQL below reads). `managed` and `turn` still read
+t3's SQLite read-only: `managed` runs inside the coding session (t3-notify,
+as the t3 user), which must not hold a t3ctl credential.
+
+Every registration decision is logged, one JSON line, beside the events DB
+(t3ctl-events.log): which HERMES_SESSION_* variables were present (names,
+never values) and, for a manual fallback, why.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -53,8 +65,12 @@ def connect(path=None):
         db.close()
 
 
-def eligible(env):
-    """Whether the calling Hermes session takes T3 state changes as new turns.
+SESSION_VARS = ('HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PLATFORM')
+
+
+def decide(env):
+    """(eligible, reason): whether the calling Hermes session takes T3 state
+    changes as new turns, and if not, why — naming variables, never values.
 
     Interactive messaging sessions do. CLI sessions and webhook/api_server runs
     do not: a one-shot run has ended before its result arrives. The exception
@@ -62,13 +78,61 @@ def eligible(env):
     in T3CTL_EVENTS_ORIGINS (comma-separated) — a lane the operator knows keeps
     one session across turns, such as one session per Linear thread.
     """
-    if env.get('T3CTL_EVENTS_ENABLED') != '1' or not env.get('HERMES_SESSION_ID') or not env.get('HERMES_SESSION_KEY'):
-        return False
-    platform = env.get('HERMES_SESSION_PLATFORM')
-    if platform not in ('webhook', 'api_server'):
-        return bool(platform)
-    chat = env.get('HERMES_SESSION_CHAT_ID', '')
-    return any(chat.startswith(p.strip()) for p in env.get('T3CTL_EVENTS_ORIGINS', '').split(',') if p.strip())
+    if env.get('T3CTL_EVENTS_ENABLED') != '1':
+        return False, 'events-disabled'
+    missing = [name for name in SESSION_VARS if not env.get(name)]
+    if missing:
+        return False, 'missing:' + ','.join(missing)
+    platform = env['HERMES_SESSION_PLATFORM']
+    if platform in ('webhook', 'api_server'):
+        chat = env.get('HERMES_SESSION_CHAT_ID', '')
+        if not any(chat.startswith(p.strip()) for p in env.get('T3CTL_EVENTS_ORIGINS', '').split(',') if p.strip()):
+            return False, f'platform:{platform}-not-in-origins'
+    return True, None
+
+
+def eligible(env):
+    return decide(env)[0]
+
+
+def log_path():
+    return Path(os.environ.get('T3CTL_EVENTS_LOG', str(database_path().parent / 't3ctl-events.log')))
+
+
+def log_decision(receipt, env, monitoring, reason, path=None):
+    """Append one line per registration decision; size-capped (one rotation)."""
+    path = Path(path or log_path())
+    line = json.dumps({
+        'ts': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+        'threadId': receipt.get('threadId'), 'dispatchId': receipt.get('dispatchId'),
+        'platform': env.get('HERMES_SESSION_PLATFORM') or None,
+        'monitoring': monitoring, 'reason': reason,
+        'present': sorted(k for k, v in env.items() if k.startswith('HERMES_SESSION_') and v),
+    })
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cap = int(os.environ.get('T3CTL_EVENTS_LOG_MAX', '1000000'))
+        if path.exists() and path.stat().st_size + len(line) > cap:
+            path.replace(path.with_name(path.name + '.1'))
+        with open(path, 'a') as f:
+            f.write(line + '\n')
+    except OSError as exc:
+        logger.warning('could not write %s: %s', path, exc)
+
+
+def register_decision(receipt, env=None, path=None, log=None):
+    """register(), plus the reason a session falls back to manual monitoring."""
+    env = os.environ if env is None else env
+    eligible_now, reason = decide(env)
+    try:
+        ok = register(receipt, env, path)
+    except (sqlite3.Error, OSError, KeyError) as exc:
+        logger.warning('event registration failed: %s', exc)
+        ok = False
+        if eligible_now:   # an ineligible session keeps its own reason; only the cleanup failed
+            reason = 'registration-error'
+    log_decision(receipt, env, 'events' if ok else 'manual', None if ok else reason, log)
+    return {'registered': ok, **({} if ok else {'reason': reason})}
 
 
 def register(receipt, env=None, path=None):
@@ -294,7 +358,7 @@ def main():
     args = parser.parse_args()
     if args.action == 'register':
         import sys
-        print(json.dumps({'registered': register(json.load(sys.stdin))}))
+        print(json.dumps(register_decision(json.load(sys.stdin))))
     elif args.action == 'eligible':
         raise SystemExit(0 if eligible(os.environ) else 1)
     elif args.action == 'status':

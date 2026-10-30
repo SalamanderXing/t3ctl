@@ -9,13 +9,35 @@ T3CTL_URL=http://127.0.0.1:3773
 T3CTL_T3_USER=dev
 T3CTL_T3_WORKDIR=/data/workspace
 T3CTL_T3_VERSION_FILE=/etc/default/t3
-T3CTL_DB=/data/home/dev/.t3/userdata/statev2.sqlite   # t3's V2 db; t3-events/contract-check read it (read-only)
+T3CTL_DB=/data/home/dev/.t3/userdata/statev2.sqlite   # t3's V2 db; t3-events `managed`/contract-check read it (read-only)
 
-# Bearer token written by t3-token-renew (root-only).
+# Credentials written by t3-token-renew (root-only), both least-privilege.
+# Since v0.6.0 there are two: T3's MCP endpoint accepts only `mcp-client`
+# sessions, and every other path rejects them.
+# 1. The legacy-path session (approvals, the callback approver, stop, rm,
+#    list --all, say --mode/--plan/--execute, project add/set-model):
 T3CTL_TOKEN_FILE=/etc/t3ctl/token
 T3CTL_SESSION_FILE=/etc/t3ctl/session-id
 T3CTL_TOKEN_TTL=30d
 T3CTL_TOKEN_LABEL=t3ctl
+#T3CTL_TOKEN_SCOPES="orchestration:read orchestration:operate"   # its scopes (default)
+# 2. The MCP credential (everything else). Defaults derive from the keys
+#    above, so an existing conf needs no new lines:
+#T3CTL_MCP_TOKEN_FILE=/etc/t3ctl/token.mcp          # default: $T3CTL_TOKEN_FILE.mcp
+#T3CTL_MCP_SESSION_FILE=/etc/t3ctl/session-id.mcp   # default: $T3CTL_SESSION_FILE.mcp
+#T3CTL_MCP_TOKEN_LABEL=t3ctl-mcp                    # default: $T3CTL_TOKEN_LABEL-mcp
+#T3CTL_MCP_ACCESS=full-access   # runtime-mode ceiling T3 enforces on it: the broadest
+#                               # mode t3ctl may start/message/settle a thread in.
+#                               # Default full-access when T3CTL_ALLOW_FULL_ACCESS=1,
+#                               # else auto; full-access is refused when that is 0.
+#                               # Minted with a one-time pairing code (OAuth approval):
+#                               # a CLI-issued mcp-client session is capped at
+#                               # approval-required. TTL is T3's fixed 30 d.
+#T3CTL_DISPATCH_LEDGER=/etc/t3ctl/token.mcp.dispatches   # default: $T3CTL_MCP_TOKEN_FILE.dispatches;
+#                               # dispatch id → credential fingerprint, so a --dispatch-id
+#                               # replay after a rotation is refused instead of duplicated
+#T3CTL_WATCH_SLICE=15           # watch blocks server-side in slices of this many seconds,
+#                               # re-checking for pending approvals/questions between them
 
 # Threads the agent creates are titled with this prefix; stop/interrupt/rm
 # refuse other threads without --force, and the callback approver only acts
@@ -45,3 +67,9 @@ T3CTL_ALERT_FALLBACK=
 #T3CTL_DEFAULT_MODE=full-access # mode `new` starts threads in (default approval-required; full-access needs ALLOW=1)
 #T3CTL_DENY_ORIGINS=webhook:auto-demo   # Hermes session origins that may never reach t3
 #T3CTL_EVENTS_ORIGINS=webhook:linear-comment:thread-   # webhook chat ids whose persistent sessions take T3 events
+
+# --- Session state events (t3-events). Every registration decision is logged
+# beside the events DB; a manual fallback names its reason (monitoringReason).
+#T3CTL_EVENTS_DB=$T3CODE_HOME/t3ctl-events.sqlite
+#T3CTL_EVENTS_LOG=$T3CODE_HOME/t3ctl-events.log     # default: next to the events DB
+#T3CTL_EVENTS_LOG_MAX=1000000                       # bytes; one rotation (.log.1)

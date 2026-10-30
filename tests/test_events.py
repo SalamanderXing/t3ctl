@@ -138,6 +138,30 @@ class EventsTest(unittest.TestCase):
     def test_webhook_cannot_register_callback_loop(self):
         self.assertFalse(events.register(self.receipt, {**self.env, 'HERMES_SESSION_PLATFORM': 'webhook'}, self.db))
 
+    def test_decide_names_the_first_reason_variables_only(self):
+        self.assertEqual(events.decide(self.env), (True, None))
+        self.assertEqual(events.decide({**self.env, 'T3CTL_EVENTS_ENABLED': '0'}), (False, 'events-disabled'))
+        self.assertEqual(events.decide({k: v for k, v in self.env.items() if k != 'HERMES_SESSION_KEY'}),
+                         (False, 'missing:HERMES_SESSION_KEY'))
+        self.assertEqual(events.decide({**self.env, 'HERMES_SESSION_PLATFORM': 'webhook', 'HERMES_SESSION_CHAT_ID': 'webhook:x:1'}),
+                         (False, 'platform:webhook-not-in-origins'))
+
+    def test_register_decision_logs_and_reports_registration_errors(self):
+        log = self.db.with_name('decisions.log')
+        out = events.register_decision(self.receipt, self.env, self.db, log)
+        self.assertEqual(out, {'registered': True})
+        blocker = self.db.with_name('blocker')
+        blocker.write_text('a file where the events DB directory should be')
+        bad = events.register_decision(self.receipt, self.env, blocker / 'events.sqlite', log)
+        self.assertEqual(bad, {'registered': False, 'reason': 'registration-error'})
+        off = events.register_decision(self.receipt, {**self.env, 'T3CTL_EVENTS_ENABLED': '0'}, self.db, log)
+        self.assertEqual(off, {'registered': False, 'reason': 'events-disabled'})
+        lines = [json.loads(l) for l in log.read_text().splitlines()]
+        self.assertEqual([(l['monitoring'], l['reason']) for l in lines],
+                         [('events', None), ('manual', 'registration-error'), ('manual', 'events-disabled')])
+        self.assertTrue(all(l['present'] == ['HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PLATFORM'] for l in lines))
+        self.assertNotIn('parent', log.read_text())
+
     def test_listed_persistent_webhook_origin_registers(self):
         webhook = {**self.env, 'HERMES_SESSION_PLATFORM': 'webhook',
                    'HERMES_SESSION_CHAT_ID': 'webhook:linear-comment:thread-abc',

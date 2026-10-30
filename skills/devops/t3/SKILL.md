@@ -3,7 +3,7 @@ name: t3
 # NOTE: the skill INDEX truncates this to ~64 chars — trigger words first;
 # everything after "reply." is only read once the skill is opened.
 description: t3, T3 Code coding sessions: start, watch, approve, reply. Drive the user's coding-agent threads on the devbox via t3ctl. Use when the user says t3/t3code, wants a coding task kicked off in a repo, asks what a session is doing, or wants to approve/deny what one is asking.
-version: 1.0.0
+version: 1.1.0
 prerequisites:
   commands: [t3ctl]
 metadata:
@@ -24,13 +24,14 @@ parse it, don't paste it raw at the user.
 t3ctl projects                       # what projects exist
 t3ctl models                         # model choices usable with --model
 t3ctl list [--unarchived|--active|--all]  # threads + status (JSONL); bare = the inbox (unsettled)
-t3ctl new <project> "<prompt>" [--title T] [--plan] [--model M]
+t3ctl new <project> "<prompt>" [--title T] [--plan] [--model M] [--dispatch-id ID]
 t3ctl say <thread> --prompt-file <path|-> --expect-turn <turnId> [--execute] [--model M]   # follow-up turn
 t3ctl last <thread> [--json]         # latest assistant reply, full, plain text (--json adds turnId)
 t3ctl answer <thread> <requestId> --answers-file <path|->  # JSON keyed by question id
 t3ctl show <thread> [-n TURNS]       # messages, state, approvals
 t3ctl search "<text>" [--limit N]    # find threads: title OR message content
-t3ctl watch <thread> [--timeout S]   # block until settled or attention needed
+t3ctl watch <thread> --message-id <messageId> [--timeout S]   # waits server-side until settled
+                                     # or attention needed — never loop/sleep around it
 t3ctl settle <thread>                # mark done → leaves the user's inbox
 t3ctl unsettle <thread>              # put back into the user's inbox
 t3ctl approvals <thread>             # approval requests + requestIds
@@ -39,8 +40,17 @@ t3ctl interrupt|stop|rm <thread>     # only on threads YOU created
 ```
 
 `<thread>`/`<project>` take a full id, unique id prefix, or project title.
-Piped output is never truncated (no `T3CTL_TEXT_CAP` needed); to read a
-reply use `t3ctl last`, not `show` plus a script.
+Piped output is never truncated (no `T3CTL_TEXT_CAP` needed).
+
+Two habits to drop, because t3ctl does them better:
+- **Reading a reply:** `t3ctl last <thread>` prints the latest assistant reply
+  whole, as plain text (`--json` adds the `turnId` for `--expect-turn`). Never
+  pipe `show` into `python`/`jq` to dig a reply out.
+- **Waiting:** `t3ctl watch <thread> --message-id <messageId>` blocks inside the
+  T3 server until the turn settles or needs you, and returns one JSON line.
+  Never write shell `while`/`until` loops, `sleep` polls, or repeated
+  `show`/`list` calls to wait for a thread. If `watch` returns `timeout`, run
+  the same `watch` again (or report progress).
 
 ## The normal flow
 
@@ -62,8 +72,15 @@ reply use `t3ctl last`, not `show` plus a script.
    error, approval and input requests return to this same conversation as a new
    turn. Continue independent work or go quiet; do not watch/list/sleep-poll.
    A background relay checks typed T3 state without involving a model. With
-   `manual`, use `t3ctl watch <threadId> --message-id <messageId>` from the
+   `manual`, use one `t3ctl watch <threadId> --message-id <messageId>` from the
    receipt. This prevents confusing the previous turn with a delayed dispatch.
+   A `manual` receipt also carries `monitoringReason`, saying why events were
+   not available: `events-disabled`, `missing:HERMES_SESSION_KEY` (or another
+   `HERMES_SESSION_*` variable the terminal did not receive),
+   `platform:webhook-not-in-origins`, `registration-error`,
+   `relay-not-installed`. In a chat where you expected `events`, tell the user
+   that reason once (it is logged on the box too); then use `watch` as above.
+   Never re-dispatch to get `events`.
    `watch` returns a `reason`:
    - `settled` — turn finished; `lastAssistant` has the reply. Relay to the user.
    - `pending-approval` — `approvals[].payload` has the requestId and detail.
@@ -98,6 +115,10 @@ thread, 28 s apart). So on a thread you are driving:
 - Wait for completion through ONE channel: with `monitoring: events` the
   relay is it — no background `watch` with completion notifications on top.
   With `manual`, one `watch` (or the callback), not both.
+
+If a `new`/`say` might need retrying (it errored or timed out after sending),
+pass your own `--dispatch-id <unique id>` and reuse the same id on the retry:
+T3 returns the same thread and message instead of starting duplicate work.
 
 Use `--prompt-file` for substantial prompts and review feedback (or `-` for
 stdin). Write the text with a file tool or quoted heredoc first. Never embed
@@ -159,7 +180,7 @@ A callback is a signal to check the thread, not a conversation partner:
 reply into the thread only when it moves the task forward. Because
 callbacks arrive on their own, prefer dispatching a thread and going quiet
 over sitting in `t3ctl watch` — watch is for when you need the answer
-within the current conversation.
+within the current conversation (and then one `watch`, never a loop).
 
 ## Recurring jobs (scheduling policy)
 
@@ -209,4 +230,4 @@ Two different questions — use the right filter:
   NOT that the inbox is empty.
 
 For one thread's story: `t3ctl show <id> -n 4`. Summarize; include
-`lastError` if set.
+`lastError` if set. For just its latest reply: `t3ctl last <id>`.

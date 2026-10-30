@@ -3,12 +3,14 @@
 and test_transport.py.
 
 Implements exactly the surface bin/t3ctl uses:
+  POST /mcp + OAuth sign-in                    T3's orchestration MCP (tests/fake_t3_mcp.py)
   GET /api/orchestration/shell                 (needs x-t3-orchestration-protocol: 2)
   GET /api/orchestration/threads/<id>/bounded  (same)
   GET /ws?orchestrationProtocol=2              WebSocket, Effect-RPC JSON frames:
       orchestration.dispatchCommand, orchestration.searchThreads, projects.mutate
-Bearer auth: any token listed (one per line) in --tokens-file is accepted;
-the file is re-read on every request so the test can revoke/mint tokens.
+Bearer auth: any token listed (one per line) in --tokens-file is accepted on
+the legacy routes, any listed in --mcp-tokens-file ("<token> <access>") on
+/mcp only; the files are re-read on every request so tests can revoke/mint.
 Every dispatched command (and project mutation) is appended to --state (JSON
 list) and applied to the in-memory model just enough for t3ctl's follow-up
 reads. Like the real server, a bare GET without the protocol header is a 400,
@@ -33,11 +35,15 @@ import hashlib
 import json
 import struct
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fake_t3_mcp  # noqa: E402
 
 ACTIVE = ("preparing", "queued", "starting", "running", "waiting")
 COMMANDS = {
@@ -75,10 +81,26 @@ class State:
         self.threads = {t["id"]: normalise(t) for t in (seed or {}).get("threads", [])}
         self.sequence = 0
         self.dispatched: list[dict] = []
+        self.lock = threading.RLock()
+        self.run_hooks: list = []   # called (thread, run, messageId) for every new run, legacy or MCP
+
+    def on_run(self, thread: dict, run: dict, message_id: str) -> None:
+        for hook in self.run_hooks:
+            hook(thread, run, message_id)
 
     def _log(self, cmd: dict) -> None:
         self.dispatched.append(cmd)
         self.state_path.write_text(json.dumps(self.dispatched, indent=1))
+
+    log = _log
+
+    @staticmethod
+    def new_thread(t: dict) -> dict:
+        return normalise(t)
+
+    @staticmethod
+    def now() -> str:
+        return now()
 
     # ---- reads ---------------------------------------------------------------
     def shell_thread(self, t: dict) -> dict:
@@ -115,7 +137,8 @@ class State:
                                      **({"decision": r["decision"]} if r.get("decision") else {})})
             if r["kind"] == "user_input":
                 items.append({"type": "user_input_request", "requestId": r["id"], "runId": r.get("runId"),
-                              "questions": r.get("questions", []), "nativeItemRef": None})
+                              "questions": r.get("questions", []), "nativeItemRef": None,
+                              **({"responseMode": r["responseMode"]} if r.get("responseMode") else {})})
                 continue
             items.append({"type": "command_execution", "runId": r.get("runId"), "input": r["command"],
                           "nativeItemRef": {"driver": "fake", "nativeId": tool, "strength": "strong"}})
@@ -186,6 +209,7 @@ class State:
             t["runs"].append(run)
             t["messages"].append({"id": cmd["messageId"], "role": "user", "text": cmd["text"],
                                   "createdAt": now(), "runId": run["id"]})
+            self.on_run(t, run, cmd["messageId"])
             if cmd.get("modelSelection"):
                 t["modelSelection"] = cmd["modelSelection"]
         elif kind == "runtime-request.respond":
@@ -235,10 +259,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:
+        url = urlparse(self.path)
+        fake_t3_mcp.ensure(self.server)
+        if url.path == "/mcp":
+            return fake_t3_mcp.handle_mcp(self)
+        if url.path.startswith("/oauth/mcp/"):
+            return fake_t3_mcp.handle_oauth(self, url.path)
+        self._json(404, {"error": "not found"})
+
+    def do_DELETE(self) -> None:
+        fake_t3_mcp.ensure(self.server)
+        if urlparse(self.path).path == "/mcp":
+            return fake_t3_mcp.handle_mcp(self)
+        self._json(404, {"error": "not found"})
+
     def do_GET(self) -> None:
         url = urlparse(self.path)
         if url.path == "/ws":
             return self._websocket(url)
+        if url.path == "/.well-known/oauth-authorization-server":
+            fake_t3_mcp.ensure(self.server)
+            return fake_t3_mcp.handle_oauth(self, url.path)
         if not self._auth():
             self._json(401, {"_tag": "EnvironmentAuthInvalidError", "code": "auth_invalid"})
             return
@@ -253,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         prefix, suffix = "/api/orchestration/threads/", "/bounded"
         if url.path.startswith(prefix) and url.path.endswith(suffix):
-            t = state.threads.get(url.path[len(prefix):-len(suffix)])
+            t = state.threads.get(unquote(url.path[len(prefix):-len(suffix)]))   # decoded, like T3
             if t is None:
                 self._json(404, {"error": "no such thread"})
                 return
@@ -330,11 +372,19 @@ def main() -> None:
     ap.add_argument("--tokens-file", required=True)
     ap.add_argument("--state", required=True, help="JSON file receiving every dispatched command")
     ap.add_argument("--seed", help="JSON file with initial {projects, threads}")
+    ap.add_argument("--mcp-tokens-file", help='"<token> <access>" lines accepted on /mcp')
+    ap.add_argument("--auth-dir", help="pairings.jsonl / sessions.jsonl shared with the fake t3 CLI")
+    ap.add_argument("--mcp-sse", action="store_true", help="answer /mcp as text/event-stream")
+    ap.add_argument("--mcp-missing", default="", help="comma-separated tools to leave out of tools/list")
     args = ap.parse_args()
     seed = json.loads(Path(args.seed).read_text()) if args.seed else None
     srv = Server(("127.0.0.1", args.port), Handler)
     srv.state = State(seed, Path(args.state))
     srv.tokens_file = Path(args.tokens_file)
+    srv.mcp_tokens_file = args.mcp_tokens_file
+    srv.auth_dir = args.auth_dir
+    srv.mcp_sse = args.mcp_sse
+    srv.mcp_missing = [t for t in args.mcp_missing.split(",") if t]
     print(f"fake t3 listening on {args.port}", file=sys.stderr, flush=True)
     srv.serve_forever()
 
