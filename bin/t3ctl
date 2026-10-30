@@ -588,6 +588,26 @@ events_log_fallback() { # $1 receipt, $2 reason — when t3-events itself could 
         monitoring:"manual", reason:$reason, present:$present}' >> "$EVENTS_LOG"; } 2>/dev/null || true
 }
 
+register_dispatch() { # stdin receipt, $1 thread id → register_events, unless this is a replay whose run the thread has moved past
+  # A replayed or re-tried --dispatch-id re-registers its receipt so a lost
+  # registration can be recovered. Once a newer dispatch has started a later
+  # turn, registering the old receipt would replace that dispatch's
+  # subscription and supersede its pending events: its result would never
+  # reach the conversation. Such a replay only returns its receipt.
+  local receipt turn latest=""
+  receipt=$(cat)
+  turn=$(jq -r '.turnId // empty' <<<"$receipt")
+  if [ -n "$REPLAY$ATTEMPTED" ] && [ -n "$turn" ] && mcp_raw thread "$1"; then
+    latest=$(jq -r '.latestTurn.turnId // "none"' <<<"$MCP_OUT")
+    if [ "$latest" != "$turn" ]; then
+      events_log_fallback "$receipt" replay-superseded
+      jq -c '. + {monitoring:"manual", monitoringReason:"replay-superseded"}' <<<"$receipt"
+      return
+    fi
+  fi
+  printf '%s' "$receipt" | register_events
+}
+
 register_events() {
   # Every manual fallback names its reason (monitoringReason, variable names
   # only) and every decision is logged beside the events DB, so the next
@@ -715,7 +735,7 @@ Run it as a plain command exactly in that form (double-quoted summary, no other 
          --arg dispatch_id "$dispatch_id" --argjson msel "$msel" \
     '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state,
       turnId:(if $state == "not-visible" then null else $sent.runId end), previousTurnId:"none",
-      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_events
+      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch "$tid"
 }
 
 cmd_say() {
@@ -834,7 +854,7 @@ cmd_say() {
   jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --argjson sent "$sent" --arg old "$old" --arg dispatch_id "$dispatch_id" \
     '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $sent.runId end),
       previousTurnId:(if $old == $sent.runId then "none" else $old end),   # a ledger entry from before v0.6.1 has no predecessor
-      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_events
+      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch "$TID"
 }
 
 cmd_answer() {

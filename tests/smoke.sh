@@ -251,6 +251,25 @@ again=$("$T3CTL" say "$TID" "round 4" --dispatch-id say-replay-2 --expect-turn "
 [ "$(jq -r .previousTurnId <<<"$again")" = "$moved" ] || fail "its replay reports the same predecessor, not the refused attempt's: $again"
 ok "say --dispatch-id replay keeps the turn it was first sent after"
 
+# Events-managed: replaying an older dispatch after a newer one must not take
+# over the newer dispatch's subscription (its result would never arrive).
+(
+  export T3CTL_EVENTS_ENABLED=1 T3CTL_EVENTS_DB="$TMP/replay-events.sqlite" T3CTL_EVENTS_LOG="$TMP/replay-events.log"
+  export HERMES_SESSION_ID=s-replay HERMES_SESSION_KEY=k-replay HERMES_SESSION_PLATFORM=discord
+  sub() { python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select dispatch_id from subscriptions where thread_id=?", (sys.argv[2],)).fetchone()[0])' "$T3CTL_EVENTS_DB" "$TID"; }
+  a=$("$T3CTL" say "$TID" "dispatch A" --dispatch-id ev-replay-a)
+  [ "$(jq -r .monitoring <<<"$a")" = events ] || fail "an eligible session is events-managed: $a"
+  b=$("$T3CTL" say "$TID" "dispatch B" --dispatch-id ev-replay-b)
+  [ "$(sub)" = ev-replay-b ] || fail "the newer dispatch owns the subscription"
+  again=$("$T3CTL" say "$TID" "dispatch A" --dispatch-id ev-replay-a)
+  [ "$(jq -r .messageId <<<"$again")" = "$(jq -r .messageId <<<"$a")" ] || fail "the replay returns A's message"
+  [ "$(jq -r .monitoringReason <<<"$again")" = replay-superseded ] || fail "a superseded replay says why it is not monitored: $again"
+  [ "$(sub)" = ev-replay-b ] || fail "replaying A after B replaced B's subscription"
+  same=$("$T3CTL" say "$TID" "dispatch B" --dispatch-id ev-replay-b)
+  [ "$(jq -r .monitoring <<<"$same")" = events ] || fail "replaying the latest dispatch still (re)registers it: $same"
+) || exit 1
+ok "an older dispatch's replay never takes over a newer dispatch's events"
+
 # ---- 2c. last / text cap ----------------------------------------------------
 out=$("$T3CTL" last "$SEED_OTHER"); [ ${#out} -eq 3500 ] || fail "last prints the whole reply as plain text (got ${#out} chars)"
 out=$("$T3CTL" show "$SEED_OTHER"); assert_contains "$out" "$LONG\"" "piped show is not truncated"
