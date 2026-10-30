@@ -1,27 +1,36 @@
 #!/usr/bin/env bash
 # t3ctl — drive T3 Code sessions from an agent (Hermes). JSON out.
 #
-# Thin wrapper over t3's local orchestration API (127.0.0.1:3773) — the same
-# authenticated API the desktop app drives. Since t3 0.0.46 (orchestration V2)
-# reads are HTTP GETs carrying `x-t3-orchestration-protocol: 2`, and every
-# command is an Effect-RPC call over the /ws WebSocket (bin/t3-rpc). The V2
-# read model (runs, runtime requests, turn items) is normalised below into the
-# turn/approval shape t3ctl's output has always had.
+# Since v0.6.0 t3ctl speaks T3's orchestration MCP endpoint (POST /mcp, the
+# server T3's own agents use; bin/t3-mcp) for everything MCP covers: projects,
+# models, list, search, show, last, new, say, watch, answer, settle/unsettle,
+# interrupt. What MCP cannot do (approvals, the callback approver, stop, rm,
+# list --all, mode changes on say, project add/set-model) stays on the app's
+# private API, isolated in bin/t3ctl-legacy.sh. MCP results are normalised
+# below into the turn/approval shape t3ctl's output has always had.
 #
 # Configuration: /etc/t3ctl.conf (see t3ctl.conf.example; override the path
 # with T3CTL_CONF); every T3CTL_* below can also come from the environment.
 #
-# Two token modes:
+# Two credentials, because /mcp only accepts `mcp-client` sessions and every
+# other path rejects them:
+#   T3CTL_MCP_TOKEN_FILE  an mcp-client session with orchestration:read +
+#        orchestration:operate and a runtime-mode ceiling (T3CTL_MCP_ACCESS).
+#        A ceiling is only granted through T3's OAuth approval, so it is
+#        minted with a one-time pairing code (a CLI-issued mcp-client session
+#        is capped at approval-required: it could not drive a full-access thread).
+#   T3CTL_TOKEN_FILE      an ordinary session with T3CTL_TOKEN_SCOPES only
+#        (orchestration:read + orchestration:operate) for the legacy calls.
+# Two token modes, for both:
 #   file (default, devbox): t3-token-renew (weekly timer) mints as the t3 user
-#        and writes the token root-only; t3ctl re-reads it per invocation.
+#        and writes the tokens root-only; t3ctl re-reads them per invocation.
 #   self (containers): t3ctl runs as the same user and T3CODE_HOME as the t3
-#        server and mints/rotates its own 30 d session on first use and on 401.
+#        server and mints/rotates its own sessions on first use and on 401.
 #
-# The API is internal to the pinned t3 nightly. If commands break after a
-# T3_VERSION bump, run `t3ctl contract-check`, then re-extract the contracts
-# from the source map: docs/t3-hermes-control.md §4 and docs/COMPAT.md.
+# If commands break after a T3_VERSION bump, run `t3ctl contract-check`, then
+# see docs/COMPAT.md.
 #
-# Guardrails (deliberate, do not quietly remove):
+# Guardrails (deliberate, do not quietly remove — MCP enforces none of them):
 #   - new starts turns in T3CTL_DEFAULT_MODE (approval-required unless the
 #     deployment says otherwise), say inherits the thread's mode, and
 #     --full-access / a full-access default only exist when
@@ -31,6 +40,7 @@
 #     --force (those are the owner's own sessions, not ours to kill).
 #   - T3CTL_DENY_ORIGINS refuses every command from listed Hermes session
 #     origins (unattended webhook lanes), see origin_gate below.
+#   - say --expect-turn refuses once the thread moved past the turn read.
 set -uo pipefail
 
 # shellcheck disable=SC1090
@@ -44,6 +54,10 @@ TOKEN_FILE=${T3CTL_TOKEN_FILE:-/etc/t3ctl/token}
 SESSION_FILE=${T3CTL_SESSION_FILE:-/etc/t3ctl/session-id}
 TOKEN_TTL=${T3CTL_TOKEN_TTL:-30d}
 TOKEN_LABEL=${T3CTL_TOKEN_LABEL:-t3ctl}
+TOKEN_SCOPES=${T3CTL_TOKEN_SCOPES:-orchestration:read orchestration:operate}   # the legacy-path token
+MCP_TOKEN_FILE=${T3CTL_MCP_TOKEN_FILE:-$TOKEN_FILE.mcp}
+MCP_SESSION_FILE=${T3CTL_MCP_SESSION_FILE:-$SESSION_FILE.mcp}
+MCP_LABEL=${T3CTL_MCP_TOKEN_LABEL:-$TOKEN_LABEL-mcp}
 DB=${T3CTL_DB:-/data/home/dev/.t3/userdata/statev2.sqlite}
 MAX_RUNNING=${T3CTL_MAX_RUNNING:-3}
 TAG=${T3CTL_TAG:-[agent]}
@@ -57,14 +71,28 @@ case $DEFAULT_MODE in
   full-access) [ "$ALLOW_FULL" = 1 ] || { echo "t3ctl: T3CTL_DEFAULT_MODE=full-access ignored (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL); using approval-required" >&2; DEFAULT_MODE=approval-required; };;
   *) echo "t3ctl: invalid T3CTL_DEFAULT_MODE '$DEFAULT_MODE'; using approval-required" >&2; DEFAULT_MODE=approval-required;;
 esac
+# The MCP credential's runtime-mode ceiling: T3 refuses to start, message or
+# settle a thread in a broader mode. Default: the broadest mode this
+# deployment's policy lets t3ctl use.
+if [ "$ALLOW_FULL" = 1 ]; then MCP_ACCESS=${T3CTL_MCP_ACCESS:-full-access}; else MCP_ACCESS=${T3CTL_MCP_ACCESS:-auto}; fi
+case $MCP_ACCESS in
+  approval-required|auto-accept-edits|auto) ;;
+  full-access) [ "$ALLOW_FULL" = 1 ] || { echo "t3ctl: T3CTL_MCP_ACCESS=full-access ignored (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL); using auto" >&2; MCP_ACCESS=auto; };;
+  *) echo "t3ctl: invalid T3CTL_MCP_ACCESS '$MCP_ACCESS'; using approval-required" >&2; MCP_ACCESS=approval-required;;
+esac
 DENY_ORIGINS=${T3CTL_DENY_ORIGINS:-}
 # Chars of message text shown per message (0 = no limit). The cap is for a
 # human at a terminal; an agent reading the output wants the whole reply
 # (Cactus was adding T3CTL_TEXT_CAP=50000 to most calls by hand).
 if [ -t 1 ]; then TEXT_CAP=${T3CTL_TEXT_CAP:-3000}; else TEXT_CAP=${T3CTL_TEXT_CAP:-0}; fi
 [[ $TEXT_CAP =~ ^[0-9]+$ ]] || TEXT_CAP=3000
-PROTO_HDR="x-t3-orchestration-protocol: 2"   # V2 read routes answer a bare 400 without it
-T3RPC=$(dirname "${BASH_SOURCE[0]}")/t3-rpc
+# watch blocks server-side (t3_thread_wait) in slices of this many seconds;
+# between slices it checks for pending approvals/questions, which do not end a wait.
+WATCH_SLICE=${T3CTL_WATCH_SLICE:-15}
+[[ $WATCH_SLICE =~ ^[1-9][0-9]*$ ]] || WATCH_SLICE=15
+ACTIVE_STATUSES=preparing,queued,starting,running,waiting
+HERE=$(dirname "${BASH_SOURCE[0]}")
+T3MCP=$HERE/t3-mcp
 
 die() { echo "t3ctl: $*" >&2; exit 1; }
 
@@ -82,18 +110,24 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
                                           --all everything, archived included
   t3ctl new <project> "<prompt>" [opts]   create thread + start first turn
         [--title T] [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access]
+        [--dispatch-id ID]
   t3ctl say <thread> "<text>" [opts]      start a turn on an existing thread
         [--expect-turn ID] [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access | --inherit]
+        [--dispatch-id ID]
                                           --expect-turn: refuse unless the thread's latest
                                           turn is still ID (the one you read; "none" for
                                           a thread without turns) — stops duplicate sends
+                                          --dispatch-id: reuse a receipt's dispatchId to
+                                          retry a new/say whose receipt was lost; T3
+                                          returns the same thread/message, no new work
   t3ctl show <thread> [-n TURNS]          messages, turn state, approvals
   t3ctl last <thread> [--json]            the latest assistant reply, in full, as plain
                                           text (--json: {threadId,turnId,turn,text})
   t3ctl search "<text>" [--limit N]       find threads by title or message
-                                          content (case-insensitive substring)
-  t3ctl watch <thread> [--message-id ID] [--timeout S] [--after-turn ID]      poll until the turn settles or an
-                                          approval is pending; prints outcome
+                                          content (case-insensitive)
+  t3ctl watch <thread> [--message-id ID] [--timeout S] [--after-turn ID]
+                                          wait (server-side) until the turn settles or
+                                          needs attention; prints outcome
   t3ctl answer <thread> <requestId> --answers-file path|-
                                           answer a pending question (JSON object)
   t3ctl settle <thread>                   mark done (leave the app's inbox)
@@ -110,14 +144,14 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
   t3ctl project add <path> [--title T]    register a workspace as a project
   t3ctl project set-model <project> <instanceId>:<model>
                                           set the project's default model
-  t3ctl token [status|renew]              show / rotate the bearer session
+  t3ctl token [status|renew]              show / rotate both credentials (MCP + legacy)
                                           (renew needs T3CTL_TOKEN_MODE=self;
                                           file mode rotates via t3-token-renew)
   t3ctl selftest [--project P]            end-to-end probe: new → PONG, forced
                                           callback → auto-approved → settled,
                                           then rm; JSON verdict, exit 1 on fail
-  t3ctl contract-check                    read-only probe of every API/schema
-                                          contract this build depends on
+  t3ctl contract-check                    read-only probe of every MCP tool and
+                                          legacy API contract this build depends on
   t3ctl interrupt <thread> [--force]      interrupt the running turn
   t3ctl stop <thread> [--force]           stop the provider session
   t3ctl rm <thread> [--force]             delete the thread
@@ -134,7 +168,7 @@ EOF
   exit 0
 }
 
-for c in curl jq uuidgen flock; do command -v "$c" >/dev/null || die "missing dependency: $c"; done
+for c in curl jq uuidgen flock python3; do command -v "$c" >/dev/null || die "missing dependency: $c"; done
 
 # Origin gate. Hermes bridges the calling session's identity into every
 # command's env (gateway/session_context.py _VAR_MAP: HERMES_SESSION_PLATFORM,
@@ -159,161 +193,156 @@ origin_gate
 # num FLAG VALUE — numeric flags must error on non-numeric input, not fail
 # later inside arithmetic, sqlite or sleep with a misleading message.
 num() { [[ ${2:-} =~ ^[0-9]+$ ]] || die "$1 expects a non-negative integer, got '${2:-}'"; }
+now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+uuid() { uuidgen | tr 'A-Z' 'a-z'; }
 
-# Self-service token: in T3CTL_TOKEN_MODE=self t3ctl runs as the same user and
+# ---- credentials -----------------------------------------------------------
+
+t3cli() { # the t3 CLI as the server's user; </dev/null: it blocks on an open non-tty stdin (2026-09-08)
+  T3CODE_HOME="$T3_HOME" "$T3_BIN" "$@" </dev/null
+}
+scope_flags() { local s; for s in $1; do printf -- '--scope %s ' "$s"; done; }
+
+probe_token() { # $1 rpc|mcp, $2 token → 0 when it works on its own path
+  if [ "$1" = mcp ]; then
+    T3CTL_URL="$BASE" T3CTL_MCP_BEARER="$2" "$T3MCP" probe --t3ctl >/dev/null 2>&1
+  else
+    curl -sf -m 15 -H "Authorization: Bearer $2" -H "x-t3-orchestration-protocol: 2" "$BASE/api/orchestration/shell" -o /dev/null
+  fi
+}
+
+# Self-service tokens: in T3CTL_TOKEN_MODE=self t3ctl runs as the same user and
 # T3CODE_HOME as the t3 server (the Kosmi container), so it mints its own
-# bearer session, probes it before installing it, and revokes the predecessor.
-# `auth session issue` has no --scopes flag: the token carries every scope
-# (incl. access:write) — accepted knowingly; the file mode (0600) and the
-# approvals.deny glob on it are the only narrowing available.
-# $1 = the token that just failed (empty when there was none). Serialised
-# with flock: concurrent t3ctl calls (the approver loop + the agent) can hit
-# a 401 together, and two unsynchronised rotations would interleave the
-# token/session files and revoke the wrong session.
+# sessions, probes each on its own path before installing it, and revokes the
+# predecessor. $1 = rpc|mcp, $2 = the token that just failed (empty when there
+# was none). Serialised with flock per credential: concurrent t3ctl calls (the
+# approver loop + the agent) can hit a 401 together, and two unsynchronised
+# rotations would interleave the token/session files and revoke the wrong session.
 mint_token() {
-  local failed=${1:-}
-  mkdir -p "$(dirname "$TOKEN_FILE")"
+  local kind=$1 failed=${2:-} file sfile
+  if [ "$kind" = mcp ]; then file=$MCP_TOKEN_FILE; sfile=$MCP_SESSION_FILE; else file=$TOKEN_FILE; sfile=$SESSION_FILE; fi
+  mkdir -p "$(dirname "$file")" "$(dirname "$sfile")"
   (
-    flock -w 60 9 || { echo "t3ctl: could not lock $TOKEN_FILE.lock" >&2; exit 1; }
+    flock -w 60 9 || { echo "t3ctl: could not lock $file.lock" >&2; exit 1; }
     # Someone else may have rotated while we waited for the lock.
-    if [ -s "$TOKEN_FILE" ]; then
-      cur=$(tr -d ' \t\n' < "$TOKEN_FILE")
-      if [ -n "$cur" ] && [ "$cur" != "$failed" ] \
-         && curl -sf -m 15 -H "Authorization: Bearer $cur" -H "$PROTO_HDR" "$BASE/api/orchestration/shell" -o /dev/null; then
-        echo "t3ctl: token already rotated by another process" >&2
+    if [ -s "$file" ]; then
+      cur=$(tr -d ' \t\n' < "$file")
+      if [ -n "$cur" ] && [ "$cur" != "$failed" ] && probe_token "$kind" "$cur"; then
+        echo "t3ctl: $kind token already rotated by another process" >&2
         exit 0
       fi
     fi
-    # </dev/null: the t3 CLI blocks on an open (non-tty) stdin — seen 2026-09-08.
-    out=$(T3CODE_HOME="$T3_HOME" "$T3_BIN" auth session issue --ttl "$TOKEN_TTL" --label "$TOKEN_LABEL" --json 2>&1 </dev/null) \
-      || { echo "t3ctl: '$T3_BIN auth session issue' failed: $(tail -c 300 <<<"$out")" >&2; exit 1; }
-    tok=$(jq -r '.token // empty' <<<"$out"); sid=$(jq -r '.sessionId // empty' <<<"$out")
-    [ -n "$tok" ] && [ -n "$sid" ] || { echo "t3ctl: could not parse token/sessionId from 'auth session issue' output" >&2; exit 1; }
-    curl -sSf -m 30 -H "Authorization: Bearer $tok" -H "$PROTO_HDR" "$BASE/api/orchestration/shell" -o /dev/null \
-      || { echo "t3ctl: freshly minted token failed its probe against $BASE (t3 down, or the internal API changed after a t3 bump — see docs/t3-hermes-control.md §4)" >&2; exit 1; }
-    old_sid=$(cat "$SESSION_FILE" 2>/dev/null || true)
-    umask 077
-    printf '%s\n' "$tok" > "$TOKEN_FILE.tmp" && mv "$TOKEN_FILE.tmp" "$TOKEN_FILE" || exit 1
-    printf '%s\n' "$sid" > "$SESSION_FILE.tmp" && mv "$SESSION_FILE.tmp" "$SESSION_FILE" || exit 1
-    if [ -n "$old_sid" ] && [ "$old_sid" != "$sid" ]; then
-      T3CODE_HOME="$T3_HOME" "$T3_BIN" auth session revoke "$old_sid" >/dev/null 2>&1 </dev/null \
-        || echo "t3ctl: warning: could not revoke previous session $old_sid (it expires by TTL)" >&2
+    if [ "$kind" = rpc ]; then
+      # shellcheck disable=SC2046
+      out=$(t3cli auth session issue $(scope_flags "$TOKEN_SCOPES") --ttl "$TOKEN_TTL" --label "$TOKEN_LABEL" --json 2>&1) \
+        || { echo "t3ctl: '$T3_BIN auth session issue' failed: $(tail -c 300 <<<"$out")" >&2; exit 1; }
+      tok=$(jq -r '.token // empty' <<<"$out" 2>/dev/null); sid=$(jq -r '.sessionId // empty' <<<"$out" 2>/dev/null)
+      [ -n "$tok" ] && [ -n "$sid" ] || { echo "t3ctl: could not parse token/sessionId from 'auth session issue' output" >&2; exit 1; }
+    else
+      # OAuth sign-in approved by a one-time pairing code that carries exactly
+      # the scopes T3 grants at this access level (t3-mcp scopes).
+      # shellcheck disable=SC2046
+      pair=$(t3cli auth pairing create $(scope_flags "$("$T3MCP" scopes "$MCP_ACCESS")") --ttl 10m --label "$MCP_LABEL-pairing" --json 2>&1) \
+        || { echo "t3ctl: '$T3_BIN auth pairing create' failed: $(tail -c 300 <<<"$pair" | grep -v credential)" >&2; exit 1; }
+      code=$(jq -r '.credential // empty' <<<"$pair" 2>/dev/null); pair_id=$(jq -r '.id // empty' <<<"$pair" 2>/dev/null)
+      [ -n "$code" ] || { echo "t3ctl: could not parse the pairing code from 'auth pairing create' output" >&2; exit 1; }
+      name="$MCP_LABEL $(date -u +%Y%m%dT%H%M%SZ)-$(uuid | cut -c1-8)"   # unique: finds the session id below
+      res=$(printf '%s' "$code" | T3CTL_URL="$BASE" "$T3MCP" oauth-mint --access "$MCP_ACCESS" --client-name "$name" 2>&1) || {
+        [ -z "$pair_id" ] || t3cli auth pairing revoke "$pair_id" >/dev/null 2>&1
+        echo "t3ctl: MCP sign-in failed: $(tail -c 300 <<<"$res")" >&2; exit 1; }
+      tok=$(jq -r '.token // empty' <<<"$res" 2>/dev/null)
+      [ -n "$tok" ] || { echo "t3ctl: MCP sign-in returned no token" >&2; exit 1; }
+      sid=$(t3cli auth session list --json 2>/dev/null | jq -r --arg n "$name" \
+        '[.[] | select(.client.label == $n) | .sessionId] | if length == 1 then .[0] else empty end' 2>/dev/null)
+      [ -n "$sid" ] || echo "t3ctl: warning: could not find the new MCP session's id; it cannot be revoked at the next rotation and expires by its 30 d TTL" >&2
     fi
-    echo "t3ctl: minted session $sid (ttl $TOKEN_TTL) -> $TOKEN_FILE" >&2
-  ) 9>"$TOKEN_FILE.lock"
+    probe_token "$kind" "$tok" \
+      || { echo "t3ctl: freshly minted $kind token failed its probe against $BASE (t3 down, or the API changed after a t3 bump — run t3ctl contract-check)" >&2; exit 1; }
+    old_sid=$(cat "$sfile" 2>/dev/null || true)
+    umask 077
+    printf '%s\n' "$tok" > "$file.tmp" && mv "$file.tmp" "$file" || exit 1
+    printf '%s\n' "$sid" > "$sfile.tmp" && mv "$sfile.tmp" "$sfile" || exit 1
+    if [ -n "$old_sid" ] && [ "$old_sid" != "$sid" ]; then
+      t3cli auth session revoke "$old_sid" >/dev/null 2>&1 \
+        || echo "t3ctl: warning: could not revoke previous $kind session $old_sid (it expires by TTL)" >&2
+    fi
+    echo "t3ctl: minted $kind session ${sid:-?} -> $file" >&2
+  ) 9>"$file.lock"
 }
 
-token() {
-  if [ ! -s "$TOKEN_FILE" ]; then
-    [ "$TOKEN_MODE" = self ] || die "cannot read $TOKEN_FILE (root only; mint with: systemctl start t3-token-renew)"
-    mint_token "" || die "could not mint a t3 session token"
+mcp_token() {
+  if [ ! -s "$MCP_TOKEN_FILE" ]; then
+    [ "$TOKEN_MODE" = self ] || die "cannot read $MCP_TOKEN_FILE (the MCP credential, root only; mint both with: systemctl start t3-token-renew)"
+    mint_token mcp "" || die "could not mint the MCP credential"
   fi
-  tr -d ' \t\n' < "$TOKEN_FILE"
+  tr -d ' \t\n' < "$MCP_TOKEN_FILE"
 }
 
-api() { # api METHOD PATH [JSON_BODY]
-  local method=$1 path=$2 body=${3:-} out code resp tok
-  tok=$(token) || exit 1
-  local args=(-sS -m 60 -X "$method" -H "Authorization: Bearer $tok" -H "$PROTO_HDR" -w $'\n%{http_code}')
-  [ -n "$body" ] && args+=(-H "Content-Type: application/json" --data-binary @-)
-  out=$(printf '%s' "$body" | curl "${args[@]}" "$BASE$path") || die "cannot reach t3 at $BASE — is the t3 server up? (a full disk presents exactly like this: check df -h)"
-  code=${out##*$'\n'}
-  resp=${out%$'\n'*}
-  if { [ "$code" = 401 ] || [ "$code" = 403 ]; } && [ "$TOKEN_MODE" = self ] && [ "${_T3CTL_RETRIED:-0}" = 0 ]; then
-    # Expired/revoked session: rotate once and retry the same call.
-    mint_token "$tok" || die "HTTP $code and re-minting a session failed"
-    _T3CTL_RETRIED=1 api "$method" "$path" "$body"
-    return
-  fi
-  if [ "$code" != 200 ]; then
-    echo "$resp" >&2
-    case $code in
-      401|403) if [ "$TOKEN_MODE" = self ]; then die "HTTP $code — token expired or revoked; run: t3ctl token renew"; else die "HTTP $code — token expired or revoked; run: systemctl start t3-token-renew"; fi ;;
-      *) die "HTTP $code from $method $path (if this started after a T3_VERSION bump, the internal API changed — run t3ctl contract-check, see docs/t3-hermes-control.md §4)" ;;
-    esac
-  fi
-  printf '%s' "$resp"
+# shellcheck source=t3ctl-legacy.sh
+. "$HERE/t3ctl-legacy.sh"
+
+# ---- MCP transport ---------------------------------------------------------
+
+# mcp_raw T3MCP-ARGS… → MCP_OUT, MCP_ERR, MCP_RC (not in a subshell, so callers
+# can branch on T3's typed failure code). The bearer travels in the
+# environment, never in argv. A 401 in self mode re-mints once and retries;
+# a refused credential never reached a handler, so the retry is safe.
+mcp_raw() {
+  local tok errf inf="" attempt
+  tok=$(mcp_token) || exit 1
+  errf=$(mktemp)
+  if printf '%s\n' "$@" | grep -qx -- -; then inf=$(mktemp); cat > "$inf"; fi
+  for attempt in 1 2; do
+    if [ -n "$inf" ]; then
+      MCP_OUT=$(T3CTL_URL="$BASE" T3CTL_MCP_BEARER="$tok" "$T3MCP" "$@" 2>"$errf" <"$inf"); MCP_RC=$?
+    else
+      MCP_OUT=$(T3CTL_URL="$BASE" T3CTL_MCP_BEARER="$tok" "$T3MCP" "$@" 2>"$errf"); MCP_RC=$?
+    fi
+    MCP_ERR=$(cat "$errf")
+    if [ "$MCP_RC" = 3 ] && [[ $MCP_ERR == *"HTTP 401"* || $MCP_ERR == *"HTTP 403"* ]] && [ "$TOKEN_MODE" = self ] && [ "$attempt" = 1 ]; then
+      mint_token mcp "$tok" || { rm -f "$errf" ${inf:+"$inf"}; die "MCP refused the credential and re-minting it failed"; }
+      tok=$(mcp_token) || exit 1
+      continue
+    fi
+    break
+  done
+  rm -f "$errf" ${inf:+"$inf"}
+  return "$MCP_RC"
 }
 
-rpc() { # rpc METHOD JSON_PAYLOAD → success value; one call over /ws (bin/t3-rpc)
-  local method=$1 payload=$2 tok out rc
-  tok=$(token) || exit 1
-  out=$(printf '%s' "$payload" | T3CTL_URL="$BASE" T3CTL_BEARER="$tok" "$T3RPC" "$method" 2>&1); rc=$?
-  if [ $rc -eq 3 ] && [[ $out == *"HTTP 401"* || $out == *"HTTP 403"* ]] && [ "$TOKEN_MODE" = self ] && [ "${_T3CTL_RETRIED:-0}" = 0 ]; then
-    mint_token "$tok" || die "RPC refused and re-minting a session failed"
-    _T3CTL_RETRIED=1 rpc "$method" "$payload"
-    return
-  fi
-  case $rc in
-    0) printf '%s' "$out";;
-    2) die "$method was rejected: $(head -c 600 <<<"$out")";;
-    3) die "cannot reach t3's WebSocket RPC at $BASE: $out (HTTP 426 = protocol mismatch after a T3_VERSION bump — run t3ctl contract-check)";;
-    *) die "$method failed: $(head -c 600 <<<"$out")";;
+mcp_fail() { # $1 = what was attempted; reads MCP_RC/MCP_ERR → a clear t3ctl: error
+  local code msg
+  case $MCP_RC in
+    2) code=$(jq -r '.code // "unknown"' <<<"$MCP_ERR" 2>/dev/null || echo unknown)
+       msg=$(jq -r '.message // ""' <<<"$MCP_ERR" 2>/dev/null || echo "$MCP_ERR")
+       case $code in
+         runtime_mode_escalation_denied|interaction_mode_escalation_denied)
+           die "refused by T3 ($code): $msg — t3ctl's MCP credential is capped below this thread's mode (T3CTL_MCP_ACCESS=$MCP_ACCESS; a credential keeps the ceiling it was minted with until it is rotated)";;
+         capability_denied) die "refused by T3 ($code): $msg — the MCP credential (access $MCP_ACCESS) does not grant this";;
+         thread_not_found) die "no such thread: $msg (t3ctl list)";;
+         *) die "T3 refused $1 ($code): $msg";;
+       esac;;
+    3) case $MCP_ERR in
+         *"HTTP 401"*|*"HTTP 403"*)
+           if [ "$TOKEN_MODE" = self ]; then die "${MCP_ERR#t3-mcp: } — MCP credential expired or revoked; run: t3ctl token renew"
+           else die "${MCP_ERR#t3-mcp: } — MCP credential expired or revoked; run: systemctl start t3-token-renew"; fi;;
+         *) die "cannot reach t3's MCP endpoint: ${MCP_ERR#t3-mcp: } — is the t3 server up? (a full disk presents exactly like this: check df -h)";;
+       esac;;
+    4) die "MCP protocol error during $1: ${MCP_ERR#t3-mcp: } (if this started after a T3_VERSION bump, run t3ctl contract-check)";;
+    *) die "t3-mcp $1 failed: $(head -c 600 <<<"$MCP_ERR")";;
   esac
 }
 
-# Every client command carries who created it; t3's own orchestrator MCP marks
-# agent-dispatched work agent/mcp, and the app labels such messages as agent-sent.
-dispatch() { rpc orchestration.dispatchCommand "$(jq -c '. + {createdBy:"agent", creationSource:"mcp"}
-  | if (.type == "thread.create" or .type == "message.dispatch") then . else del(.createdBy, .creationSource) end' <<<"$1")"; }
+mcp() { mcp_raw "$@" || mcp_fail "$1 ${2:-}"; printf '%s' "$MCP_OUT"; }
 
-# V2 run status → the turn states t3ctl has always reported.
-TURN_STATE='def turn_state: if . == null then "none"
-    elif IN("preparing","queued","starting","running","waiting") then "running"
-    elif . == "completed" then "completed" elif . == "failed" then "error"
-    else "interrupted" end;'
-
-# Shell snapshot, with the V1 fields the rest of this script (and its JSON
-# output) reads: latestTurn{turnId,state}, session{status,lastError},
-# hasPendingApprovals / hasPendingUserInput. Archived threads are folded back
-# into .threads (they carry archivedAt), deleted ones dropped.
-SHELL_NORM=$TURN_STATE'
-  .threads = [(.threads + (.archivedThreads // []))[] | select(.deletedAt == null)
-    | . + {latestTurn: (if .latestRunId == null then null else
-             {turnId: .latestRunId,
-              state: (if .activeRunId != null then "running"
-                      elif .status == "idle" then "completed" else (.status | turn_state) end)} end),
-           session: {status: (.activityRunStatus // (if .activeRunId != null then "running" else "idle" end)),
-                     lastError: (.lastError // null)},
-           hasPendingApprovals: (.pendingRuntimeRequest != null and .pendingRuntimeRequest.kind != "user_input"),
-           hasPendingUserInput: (.pendingRuntimeRequest.kind == "user_input")}]'
-shell_snap() { api GET /api/orchestration/shell | jq -c "$SHELL_NORM"; }
-
-# Thread detail (bounded snapshot: full runs/requests, recent timeline) as
-# {thread:{…, latestTurn, runs, messages, approvals, userInputs}}. An approval
-# item only carries the model's description of the request; the exact command
-# is on the command_execution item with the same native tool id, so `detail`
-# is that command or null — never the description (the approver keys on it).
-DETAIL_NORM=$TURN_STATE'
-  .projection as $p
-  | ($p.runs | sort_by(.ordinal)) as $runs
-  | ($runs | last) as $last
-  | ([$runs[-($turns):][] | .id]) as $recent
-  | ($p.runtimeRequests | map({(.id): .}) | add // {}) as $rr
-  | ([$p.turnItems[] | select(.type == "command_execution" and .nativeItemRef.nativeId != null)
-      | {(.nativeItemRef.nativeId): .input}] | add // {}) as $cmds
-  | {thread: ($p.thread + {
-      latestTurn: (if $last == null then null else
-        {turnId: $last.id, state: ($last.status | turn_state), userMessageId: $last.userMessageId} end),
-      runs: [$runs[] | {id, status, userMessageId}],
-      messages: [$p.messages[] | select(.role != "system")
-        | select(.runId == null or (.runId as $r | $recent | index($r)))
-        | {id, role, text, createdAt, runId}],
-      approvals: [$p.turnItems[] | select(.type == "approval_request")
-        | ($rr[.requestId] // {}) as $q
-        | {summary: (.prompt // .title), turnId: .runId, createdAt: .startedAt,
-           payload: {requestId, requestKind, status: ($q.status // "unknown"),
-                     requestType: (if .requestKind == "command" then "command_execution_approval" else .requestKind end),
-                     detail: (if .nativeItemRef.nativeId == null then null else $cmds[.nativeItemRef.nativeId] end),
-                     decision: ($q.decision // null)}}],
-      userInputs: [$p.turnItems[] | select(.type == "user_input_request")
-        | select(($rr[.requestId].status // "") == "pending")
-        | {requestId, questions} + (if .responseMode then {responseMode} else {} end)]})}'
-thread_detail() { # $1 thread id  [$2 turns of messages, default 4]
-  api GET "/api/orchestration/threads/$1/bounded" | jq -c --argjson turns "${2:-4}" "$DETAIL_NORM"
+# V2 run status (an MCP send receipt) → the turn states t3ctl has always reported.
+turn_of() {
+  case ${1:-} in
+    preparing|queued|starting|running|waiting) echo running;;
+    completed) echo completed;; failed) echo error;;
+    ""|null) echo not-visible;; *) echo interrupted;;
+  esac
 }
-now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
-uuid() { uuidgen | tr 'A-Z' 'a-z'; }
 
 check_mode() {
   case $1 in approval-required|auto-accept-edits|auto|full-access) ;; *)
@@ -326,29 +355,46 @@ check_mode() {
   return 0
 }
 
+check_dispatch_id() {
+  [[ $1 =~ ^[A-Za-z0-9._:-]{8,128}$ ]] || die "--dispatch-id must be 8-128 chars of [A-Za-z0-9._:-] (a receipt's dispatchId)"
+}
+
 # ---- resolution ------------------------------------------------------------
 
-resolve_thread() { # $1: id or unique prefix → sets THREAD (json) and TID
-  local q=$1 m n
-  SNAP=${SNAP:-$(shell_snap)}
-  m=$(jq -c --arg q "$q" '[.threads[] | select(.id == $q)] as $exact
-        | if ($exact|length) == 1 then $exact
-          else [.threads[] | select(.id | startswith($q))] end' <<<"$SNAP")
+load_projects() { # → PROJECTS (json array, deleted ones dropped)
+  [ -n "${PROJECTS:-}" ] && return 0
+  local cursor=0 page all='[]'
+  while [ "$cursor" != null ]; do
+    page=$(mcp call t3_project_list "{\"limit\":100,\"cursor\":$cursor}") || exit 1
+    all=$(jq -c --argjson a "$all" '$a + [.projects[] | select(.deletedAt == null)]' <<<"$page")
+    cursor=$(jq -r '.nextCursor // "null"' <<<"$page")
+  done
+  PROJECTS=$all
+}
+
+resolve_thread() { # $1: id or unique prefix → THREAD (normalised json), TID
+  local q=$1 m n code
+  if mcp_raw thread "$q"; then THREAD=$MCP_OUT; TID=$(jq -r .id <<<"$THREAD"); return 0; fi
+  code=$(jq -r '.code // empty' <<<"$MCP_ERR" 2>/dev/null)
+  { [ "$MCP_RC" = 2 ] && [ "$code" = thread_not_found ]; } || mcp_fail "read $q"
+  # Not a full id: a unique prefix among unarchived threads (one listing).
+  m=$(mcp threads --all-projects) || exit 1
+  m=$(jq -c --arg q "$q" '[.[] | select(.id | startswith($q))]' <<<"$m")
   n=$(jq length <<<"$m")
   [ "$n" -eq 0 ] && die "no thread matches '$q' (t3ctl list)"
   [ "$n" -gt 1 ] && { jq -r '.[] | "\(.id)  \(.title)"' <<<"$m" >&2; die "'$q' matches $n threads"; }
-  THREAD=$(jq -c '.[0]' <<<"$m")
-  TID=$(jq -r '.id' <<<"$THREAD")
+  mcp_raw thread "$(jq -r '.[0].id' <<<"$m")" || mcp_fail "read $q"
+  THREAD=$MCP_OUT; TID=$(jq -r .id <<<"$THREAD")
 }
 
 resolve_project() { # $1: id/prefix/title/basename → sets PROJECT, PID
   local q=$1 m n
-  SNAP=${SNAP:-$(shell_snap)}
+  load_projects
   m=$(jq -c --arg q "$q" '
-      [.projects[] | select(.id == $q)] as $a
-    | [.projects[] | select(.title == $q or ((.workspaceRoot | split("/") | last) == $q))] as $b
-    | [.projects[] | select(.id | startswith($q))] as $c
-    | if ($a|length) > 0 then $a elif ($b|length) > 0 then $b else $c end' <<<"$SNAP")
+      [.[] | select(.id == $q)] as $a
+    | [.[] | select(.title == $q or ((.workspaceRoot | split("/") | last) == $q))] as $b
+    | [.[] | select(.id | startswith($q))] as $c
+    | if ($a|length) > 0 then $a elif ($b|length) > 0 then $b else $c end' <<<"$PROJECTS")
   n=$(jq length <<<"$m")
   [ "$n" -eq 0 ] && die "no project matches '$q' (t3ctl projects)"
   [ "$n" -gt 1 ] && { jq -r '.[] | "\(.id)  \(.title)"' <<<"$m" >&2; die "'$q' matches $n projects"; }
@@ -356,27 +402,24 @@ resolve_project() { # $1: id/prefix/title/basename → sets PROJECT, PID
   PID=$(jq -r '.id' <<<"$PROJECT")
 }
 
+thread_selection() { # $1 thread id → its full modelSelection (options included)
+  mcp call t3_thread_configure "$(jq -cn --arg t "$1" '{threadId:$t}')" | jq -c '.modelSelection'
+}
+
 resolve_model() { # $1: model name / instanceId / "instance:model" → selection json
   # Resolved against selections real threads have used on THIS server (most
   # recent wins, options like reasoning effort come along) — no hardcoded
   # model catalog to go stale when t3 or the providers move.
-  local q=$1 m
-  SNAP=${SNAP:-$(shell_snap)}
-  m=$(jq -c --arg q "$q" '
-    [.threads[] | {sel: .modelSelection, at: .updatedAt}
-     | select(.sel != null)
-     | select(.sel.model == $q or .sel.instanceId == $q
-              or ((.sel.instanceId + ":" + (.sel.model // "")) == $q))]
-    | sort_by(.at) | last | .sel // empty' <<<"$SNAP")
-  if [ -z "$m" ]; then
-    # Literal instanceId:model — the only way to pick a model on a server no
-    # thread has used yet (fresh deployment). No options come along.
-    case $q in
-      *:*) m=$(jq -cn --arg i "${q%%:*}" --arg mo "${q#*:}" '{instanceId:$i, model:$mo}');;
-      *) die "no thread on this server has used model '$q' — pick from: $(jq -r '[.threads[].modelSelection | select(. != null) | (.instanceId + ":" + (.model // ""))] | unique | join(", ")' <<<"$SNAP"), or pass a literal instanceId:model";;
-    esac
-  fi
-  printf '%s' "$m"
+  local q=$1 m tid
+  m=$(mcp threads --all-projects --model "$q") || exit 1
+  tid=$(jq -r '.[0].id // empty' <<<"$m")
+  if [ -n "$tid" ]; then thread_selection "$tid" || exit 1; return; fi
+  # Literal instanceId:model — the only way to pick a model on a server no
+  # thread has used yet (fresh deployment). No options come along.
+  case $q in
+    *:*) jq -cn --arg i "${q%%:*}" --arg mo "${q#*:}" '{instanceId:$i, model:$mo}';;
+    *) die "no thread on this server has used model '$q' — pick from: $(mcp threads --all-projects --limit 300 | jq -r '[.[].modelSelection | select(.instanceId != null) | (.instanceId + ":" + (.model // ""))] | unique | join(", ")'), or pass a literal instanceId:model";;
+  esac
 }
 
 require_ours_or_force() { # $1: force flag (true/false)
@@ -385,72 +428,51 @@ require_ours_or_force() { # $1: force flag (true/false)
     die "thread '$(jq -r .title <<<"$THREAD")' was not created by t3ctl ($TAG prefix); this is somebody else's session — pass --force only when explicitly asked to kill it"
 }
 
-wait_turn_visible() { # $1 threadId  $2 dispatched messageId → echoes turnId + state
-  # Dispatch is async event-sourcing: the receipt returns before the run
-  # reaches the read model. A V2 run records the user message that started it
-  # (userMessageId), so wait for exactly that run rather than for "some new
-  # turn" — a follow-up `watch` can then never mistake a previous run's
-  # "completed" for this one having settled.
-  local tid=$1 mid=$2 i cur
-  for i in 1 2 3 4 5 6 7 8; do
-    cur=$(thread_detail "$tid" 1 | jq -r --arg m "$mid" "$TURN_STATE"'
-      [.thread.runs[] | select(.userMessageId == $m)] | last
-      | if . == null then empty else "\(.id) \(.status | turn_state)" end')
-    [ -n "$cur" ] && { echo "$cur"; return 0; }
-    sleep 2
-  done
-  # Still not visible after ~16 s: say so instead of handing back an older
-  # run's state, which a follow-up `watch` would misread as settled.
-  echo "none not-visible"
-}
-
-turn_json() { # $1 threadId  $2 text  $3 dispatchMode json  [$4 modelSelection]
-  printf '%s' "$2" | jq -Rsc --arg tid "$1" --argjson dmode "$3" \
-        --argjson msel "${4:-null}" --arg cid "$(uuid)" --arg mid "$(uuid)" '
-    {type:"message.dispatch", commandId:$cid, threadId:$tid, messageId:$mid,
-     text:., attachments:[], dispatchMode:$dmode}
-    + (if $msel == null then {} else {modelSelection: $msel} end)'
-}
-
 # ---- commands --------------------------------------------------------------
 
 cmd_projects() {
-  shell_snap | jq -c '.projects[] | {id, title, workspaceRoot,
-    model: (.defaultModelSelection.model // null)}'
+  load_projects
+  jq -c '.[] | {id, title, workspaceRoot, model: (.defaultModelSelection.model // null)}' <<<"$PROJECTS"
 }
 
 cmd_models() {
-  shell_snap | jq -c '
-    (.projects[0].defaultModelSelection) as $def
-    | [.threads[] | select(.modelSelection != null) | {sel: .modelSelection, at: .updatedAt}]
+  local rows; rows=$(mcp threads --all-projects) || exit 1
+  load_projects
+  jq -c --argjson def "$(jq -c '.[0].defaultModelSelection // null' <<<"$PROJECTS")" '
+    [.[] | select(.modelSelection.instanceId != null) | {sel: .modelSelection, at: .updatedAt}]
     | group_by(.sel.instanceId + ":" + (.sel.model // ""))
     | map({instanceId: .[0].sel.instanceId, model: .[0].sel.model,
            threads: length, lastUsed: (map(.at) | max),
-           projectDefault: (.[0].sel.instanceId == $def.instanceId
+           projectDefault: ($def != null and .[0].sel.instanceId == $def.instanceId
                             and .[0].sel.model == $def.model)})
-    | sort_by(-.threads) | .[]'
+    | sort_by(-.threads) | .[]' <<<"$rows"
 }
 
 cmd_list() {
   # Default = the app's inbox (unsettled, non-archived): a bare `list` on a
   # long-lived box otherwise returns every thread ever (870 rows). --unarchived
   # is the pre-v0.5 default (settled + unsettled, archived excluded).
-  local filter=unsettled
+  local filter=unsettled rows
   case ${1:-} in --all) filter=all;; --active) filter=active;; --unsettled|"") filter=unsettled;; --unarchived) filter=unarchived;; *) die "unknown flag $1 (list takes --unsettled|--unarchived|--active|--all)";; esac
   [ $# -le 1 ] || die "list takes a single flag"
-  # "settled" is server-authoritative: the decider resets settledOverride to
-  # null on any real activity, so settledOverride=="settled" IS the app's
-  # settled shelf and everything else is its inbox ("unsettled").
-  shell_snap | jq -c --arg f "$filter" '
-    .projects as $ps
-    | [.threads[]
-       | select($f == "all" or .archivedAt == null)
+  # "settled" is server-authoritative: T3 resets it on any real activity, so
+  # settled IS the app's settled shelf and everything else is its inbox.
+  case $filter in
+    all) legacy_list_all; return;;   # MCP's t3_thread_list has no archived threads
+    unsettled) rows=$(mcp threads --all-projects --settled false --enrich) || exit 1;;
+    unarchived) rows=$(mcp threads --all-projects --enrich) || exit 1;;
+    active) rows=$(mcp threads --all-projects --statuses "$ACTIVE_STATUSES" --enrich) || exit 1;;
+  esac
+  load_projects
+  jq -c --arg f "$filter" --argjson ps "$PROJECTS" '
+    ($ps | map({(.id): .title}) | add // {}) as $pt
+    | [.[]
        | {id, title,
-          project: (.projectId as $p | ($ps[] | select(.id == $p) | .title)),
+          project: ($pt[.projectId] // null),
           mode: .runtimeMode,
           session: (.session.status // "none"),
           turn: (.latestTurn.state // "none"),
-          settled: (.settledOverride == "settled"),
+          settled,
           snoozedUntil: (.snoozedUntil // null),
           pendingApprovals: .hasPendingApprovals,
           pendingUserInput: .hasPendingUserInput,
@@ -459,30 +481,67 @@ cmd_list() {
        | select($f != "active" or .turn == "running" or .pendingApprovals
                 or .pendingUserInput or .session == "starting" or .session == "running")
        | select($f != "unsettled" or (.settled | not))]
-    | sort_by(.updatedAt) | reverse | .[]'
+    | sort_by(.updatedAt) | reverse | .[]' <<<"$rows"
 }
 
 # t3-events with this box's event settings (sourced from the conf, so not
 # exported): whether a session gets events is decided there, in one place.
+EVENTS_DB=${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}
+EVENTS_LOG=${T3CTL_EVENTS_LOG:-$(dirname "$EVENTS_DB")/t3ctl-events.log}
 t3_events() {
-  T3CTL_EVENTS_ENABLED="${T3CTL_EVENTS_ENABLED:-0}" T3CTL_EVENTS_ORIGINS="${T3CTL_EVENTS_ORIGINS:-}" T3CODE_HOME="$T3_HOME" T3CTL_EVENTS_DB="${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}" "$(dirname "${BASH_SOURCE[0]}")/t3-events" "$@"
+  T3CTL_EVENTS_ENABLED="${T3CTL_EVENTS_ENABLED:-0}" T3CTL_EVENTS_ORIGINS="${T3CTL_EVENTS_ORIGINS:-}" T3CODE_HOME="$T3_HOME" \
+    T3CTL_EVENTS_DB="$EVENTS_DB" T3CTL_EVENTS_LOG="$EVENTS_LOG" "$HERE/t3-events" "$@"
+}
+
+events_log_fallback() { # $1 receipt, $2 reason — when t3-events itself could not log
+  # Names of the session variables only, never their values.
+  local present
+  present=$(compgen -e | grep '^HERMES_SESSION_' | while read -r v; do [ -n "${!v}" ] && echo "$v"; done | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
+  { mkdir -p "$(dirname "$EVENTS_LOG")" && jq -cn --argjson r "$1" --arg reason "$2" --arg ts "$(now)" \
+      --arg platform "${HERMES_SESSION_PLATFORM:-}" --argjson present "$present" \
+      '{ts:$ts, threadId:$r.threadId, dispatchId:$r.dispatchId, platform:(if $platform == "" then null else $platform end),
+        monitoring:"manual", reason:$reason, present:$present}' >> "$EVENTS_LOG"; } 2>/dev/null || true
 }
 
 register_events() {
-  local receipt result monitoring=manual
+  # Every manual fallback names its reason (monitoringReason, variable names
+  # only) and every decision is logged beside the events DB, so the next
+  # "came back manual" is diagnosable without guessing.
+  local receipt result monitoring=manual reason=""
   receipt=$(cat)
-  if [ -x "$(dirname "${BASH_SOURCE[0]}")/t3-events" ]; then
+  if [ -x "$HERE/t3-events" ]; then
     if result=$(printf '%s' "$receipt" | t3_events register); then
-      [ "$(jq -r .registered <<<"$result")" = true ] && monitoring=events
+      if [ "$(jq -r .registered <<<"$result")" = true ]; then monitoring=events
+      else reason=$(jq -r '.reason // "registration-error"' <<<"$result"); fi
     else
+      reason=registration-error
       echo "t3ctl: event registration failed; task was dispatched, use watch with messageId" >&2
+      events_log_fallback "$receipt" "$reason"
     fi
+  else
+    reason=relay-not-installed
+    [ "${T3CTL_EVENTS_ENABLED:-0}" != 1 ] || events_log_fallback "$receipt" "$reason"
   fi
-  jq -c --arg monitoring "$monitoring" '. + {monitoring:$monitoring}' <<<"$receipt"
+  jq -c --arg monitoring "$monitoring" --arg reason "$reason" \
+    '. + {monitoring:$monitoring} + (if $monitoring == "manual" then {monitoringReason:$reason} else {} end)' <<<"$receipt"
+}
+
+read_prompt() { # $1 path or - → PROMPT_TEXT (verbatim, trailing newlines kept)
+  PROMPT_TEXT=$(cat -- "$1" && printf .) || die "cannot read prompt file"
+  PROMPT_TEXT=${PROMPT_TEXT%.}
+}
+
+send_message() { # $1 thread id, $2 text, $3 dispatch id → MCP send receipt
+  # `queue`: an idle thread starts at once, a busy one gets a follow-up run
+  # after the active one — a message never steers a running turn.
+  # clientRequestId = dispatchId: T3 derives the message id from it, so a
+  # retry (lost response, --dispatch-id) returns the same message, not a second one.
+  printf '%s' "$2" | jq -Rsc --arg tid "$1" --arg rid "$3" '{threadId:$tid, message:., mode:"queue", clientRequestId:$rid}' \
+    | mcp call t3_thread_send - --retry
 }
 
 cmd_new() {
-  local project="" prompt="" prompt_file="" title="" mode=$DEFAULT_MODE imode=default explicit="" model=""
+  local project="" prompt="" prompt_file="" title="" mode=$DEFAULT_MODE imode=default explicit="" model="" dispatch_id=""
   [ "$mode" = full-access ] && explicit=explicit   # deployment default, already gated above
   while [ $# -gt 0 ]; do case $1 in
     --title) title=$2; shift 2;;
@@ -490,6 +549,7 @@ cmd_new() {
     --execute) imode=default; shift;;
     --prompt-file) [ -n "${2:-}" ] || die "--prompt-file requires a path or -"; prompt_file=$2; shift 2;;
     --model) model=$2; shift 2;;
+    --dispatch-id) check_dispatch_id "${2:-}"; dispatch_id=$2; shift 2;;
     --mode) check_mode "$2"
             if [ -n "$MODE_FIXED" ] && [ "$2" != "$DEFAULT_MODE" ]; then
               die "this deployment fixes the mode of new threads to $DEFAULT_MODE (T3CTL_DEFAULT_MODE); drop --mode and run \`new\` again"
@@ -501,37 +561,50 @@ cmd_new() {
   esac; done
   if [ -n "$prompt_file" ]; then
     [ -z "$prompt" ] || die "use either prompt text or --prompt-file"
-    prompt=$(cat -- "$prompt_file" && printf .) || die "cannot read prompt file"
-    prompt=${prompt%.}
+    read_prompt "$prompt_file"; prompt=$PROMPT_TEXT
   fi
   [ -n "$project" ] && [ -n "$prompt" ] || die "usage: t3ctl new <project> \"<prompt>\""
   [ "$mode" = full-access ] && [ -z "$explicit" ] && die "full-access needs --full-access"
 
   resolve_project "$project"
   local running
-  running=$(jq --arg tag "$TAG" '[.threads[] | select(.archivedAt == null
-    and (.title | startswith($tag)) and .latestTurn.state == "running")] | length' <<<"$SNAP")
+  running=$(mcp threads --all-projects --statuses "$ACTIVE_STATUSES" --title-contains "$TAG") || exit 1
+  running=$(jq --arg tag "$TAG" '[.[] | select(.title | startswith($tag))] | length' <<<"$running")
   [ "$running" -ge "$MAX_RUNNING" ] && \
     die "$running $TAG turns already running (limit $MAX_RUNNING) — finish or interrupt one first, or raise T3CTL_MAX_RUNNING"
 
   # model: --model wins, else project default, else the most recent thread's
-  local msel
+  local msel last
   if [ -n "$model" ]; then
-    msel=$(resolve_model "$model")
+    msel=$(resolve_model "$model") || exit 1
   else
-    msel=$(jq -c --arg pid "$PID" '
-      (.projects[] | select(.id == $pid) | .defaultModelSelection) //
-      ([.threads[] | select(.projectId == $pid)] | sort_by(.updatedAt) | last | .modelSelection) // empty' <<<"$SNAP")
+    msel=$(jq -c '.defaultModelSelection // empty' <<<"$PROJECT")
+    if [ -z "$msel" ]; then
+      last=$(mcp threads --project "$PID" --limit 1) || exit 1
+      last=$(jq -r '.[0].id // empty' <<<"$last")
+      [ -z "$last" ] || msel=$(thread_selection "$last") || exit 1
+    fi
     [ -n "$msel" ] || die "project has no defaultModelSelection and no prior thread to copy one from"
   fi
 
   [ -n "$title" ] || title="${prompt:0:48}"
   case $title in "$TAG"*) ;; *) title="$TAG $title";; esac
+  [ -n "$dispatch_id" ] || dispatch_id=$(uuid)
 
-  local tid; tid=$(uuid)
+  # Created idle first: the callback contract below needs the thread id,
+  # which T3 derives from the clientRequestId (a retry returns the same thread).
+  local launched tid
+  launched=$(jq -cn --arg pid "$PID" --arg title "$title" --argjson msel "$msel" --arg mode "$mode" \
+                    --arg imode "$imode" --arg rid "$dispatch_id" '
+    {projectId:$pid, title:$title, modelSelection:$msel, runtimeMode:$mode,
+     interactionMode:$imode, workspaceStrategy:{type:"root"}, clientRequestId:$rid}' \
+    | mcp call t3_thread_launch - --retry) || exit 1
+  tid=$(jq -r '.threadId // empty' <<<"$launched")
+  [ -n "$tid" ] || die "t3_thread_launch returned no threadId"
+
   # Callback + scheduling contract for the agent inside the session. The
   # thread id is only known here, so t3ctl injects it rather than the skill.
-  if [ -x "$(dirname "${BASH_SOURCE[0]}")/t3-events" ] && t3_events eligible; then
+  if [ -x "$HERE/t3-events" ] && t3_events eligible; then
     prompt="$prompt
 
 T3 state changes are monitored by the gateway and returned to the dispatching conversation. Do not call $NOTIFY_CMD or create polling/scheduling jobs."
@@ -543,44 +616,37 @@ Callback contract (from the dispatcher, not the task): this t3 thread's id is $t
   $NOTIFY_CMD --thread $tid --status done|blocked|approval \"<one-paragraph summary>\"
 Run it as a plain command exactly in that form (double-quoted summary, no other shell syntax): that exact command is pre-approved and runs without a prompt even in approval-required mode. Notify on those state changes only — not for progress updates. Also: never schedule recurring jobs (cron, timers, self-reminders) from inside this session; they die with it. If the work needs something recurring, say so in your callback and it will be scheduled properly outside."
   fi
-  local create
-  create=$(jq -cn --arg tid "$tid" --arg pid "$PID" --arg title "$title" \
-                  --argjson msel "$msel" --arg mode "$mode" --arg imode "$imode" \
-                  --arg cid "$(uuid)" '
-    {type:"thread.create", commandId:$cid, threadId:$tid, projectId:$pid,
-     title:$title, modelSelection:$msel, runtimeMode:$mode,
-     interactionMode:$imode, branch:null, worktreePath:null}')
-  dispatch "$create" >/dev/null
-  local command; command=$(turn_json "$tid" "$prompt" '{"type":"start_immediately"}')
-  dispatch "$command" >/dev/null || return 1
-  local visible state turn_id; visible=$(wait_turn_visible "$tid" "$(jq -r .messageId <<<"$command")")
-  turn_id=${visible%% *}; state=${visible#* }
-  jq -cn --arg id "$tid" --arg title "$title" --arg mode "$mode" \
-         --arg state "$state" --arg turn_id "$turn_id" --arg message_id "$(jq -r .messageId <<<"$command")" --arg dispatch_id "$(jq -r .commandId <<<"$command")" --argjson msel "$msel" \
-    '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:"none", dispatchId:$dispatch_id, messageId:$message_id}' | register_events
+  local sent state
+  sent=$(send_message "$tid" "$prompt" "$dispatch_id") || exit 1
+  state=$(turn_of "$(jq -r 'if .runId == null then "" else .status end' <<<"$sent")")
+  jq -cn --arg id "$tid" --arg title "$title" --arg mode "$mode" --arg state "$state" --argjson sent "$sent" \
+         --arg dispatch_id "$dispatch_id" --argjson msel "$msel" \
+    '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state,
+      turnId:(if $state == "not-visible" then null else $sent.runId end), previousTurnId:"none",
+      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_events
 }
 
 cmd_say() {
   # Continuing a thread inherits ITS runtime mode by default: owned threads
   # were created approval-required, and other people's threads keep whatever
   # they chose — a follow-up must not quietly downgrade (or upgrade) a session.
-  local thread="" text="" prompt_file="" mode="" imode="" explicit="" model="" msel=null expect_turn=""
+  local thread="" text="" prompt_file="" mode="" imode="" model="" msel="" expect_turn="" dispatch_id=""
   while [ $# -gt 0 ]; do case $1 in
     --expect-turn) [ -n "${2:-}" ] || die "--expect-turn requires a turn id (or none)"; expect_turn=$2; shift 2;;
     --plan) imode=plan; shift;;
     --execute) imode=default; shift;;
     --prompt-file) [ -n "${2:-}" ] || die "--prompt-file requires a path or -"; prompt_file=$2; shift 2;;
     --model) model=$2; shift 2;;
+    --dispatch-id) check_dispatch_id "${2:-}"; dispatch_id=$2; shift 2;;
     --mode) check_mode "$2"; mode=$2; shift 2;;
-    --full-access) [ "$ALLOW_FULL" = 1 ] || die "full-access is disabled on this deployment (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL)"; mode=full-access; explicit=explicit; shift;;
+    --full-access) [ "$ALLOW_FULL" = 1 ] || die "full-access is disabled on this deployment (T3CTL_ALLOW_FULL_ACCESS=$ALLOW_FULL)"; mode=full-access; shift;;
     --inherit) shift;;   # inherit is the default; flag kept for compatibility
     -*) die "unknown flag $1";;
     *) if [ -z "$thread" ]; then thread=$1; elif [ -z "$text" ]; then text=$1; else die "unexpected arg: $1"; fi; shift;;
   esac; done
   if [ -n "$prompt_file" ]; then
     [ -z "$text" ] || die "use either prompt text or --prompt-file"
-    text=$(cat -- "$prompt_file" && printf .) || die "cannot read prompt file"
-    text=${text%.}
+    read_prompt "$prompt_file"; text=$PROMPT_TEXT
   fi
   [ -n "$thread" ] && [ -n "$text" ] || die "usage: t3ctl say <thread> \"<text>\""
   resolve_thread "$thread"
@@ -589,48 +655,48 @@ cmd_say() {
   # it, two Hermes sessions woken by the same completion (relay, callback,
   # a background watch) each sent their own follow-up to the same thread —
   # 1.6 s apart on 2026-10-10.
-  local lockdir=${T3CTL_LOCK_DIR:-/tmp/t3ctl-locks-$(id -u)}
+  local lockdir=${T3CTL_LOCK_DIR:-/tmp/t3ctl-locks-$(id -u)} lockname
   mkdir -p "$lockdir" && chmod 700 "$lockdir" || die "cannot create lock dir $lockdir"
-  exec 8>"$lockdir/say-$TID.lock"
+  lockname=$(printf '%s' "$TID" | tr -c 'A-Za-z0-9._-' '_')
+  exec 8>"$lockdir/say-$lockname.lock"
   flock -w 120 8 || die "another t3ctl say to thread $TID has held its lock for 120 s"
-  SNAP=$(shell_snap); resolve_thread "$TID"   # re-read: the state may have moved while we waited
+  resolve_thread "$TID"   # re-read: the state may have moved while we waited
   if [ -n "$expect_turn" ]; then
     local cur_turn; cur_turn=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
     [ "$cur_turn" = "$expect_turn" ] || die "refused: thread $TID has moved past turn $expect_turn (latest is now $cur_turn) — someone else already sent a turn; read it (t3ctl last $TID) before deciding whether to send anything"
   fi
-  [ -n "$mode" ] || mode=$(jq -r '.runtimeMode' <<<"$THREAD")
-  [ -n "$imode" ] || imode=$(jq -r '.interactionMode // "default"' <<<"$THREAD")
-  [ -z "$model" ] || msel=$(resolve_model "$model")
+  local cur_mode cur_imode
+  cur_mode=$(jq -r '.runtimeMode' <<<"$THREAD"); cur_imode=$(jq -r '.interactionMode // "default"' <<<"$THREAD")
+  [ -n "$mode" ] || mode=$cur_mode
+  [ -n "$imode" ] || imode=$cur_imode
+  [ -z "$model" ] || msel=$(resolve_model "$model") || exit 1
   local old; old=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
-  # V2 messages carry no runtime/interaction mode: they are thread state, set
-  # by their own commands before the message when they differ.
-  [ "$mode" = "$(jq -r '.runtimeMode' <<<"$THREAD")" ] || dispatch "$(jq -cn --arg tid "$TID" --arg m "$mode" --arg cid "$(uuid)" \
-    '{type:"thread.runtime-mode.set", commandId:$cid, threadId:$tid, runtimeMode:$m}')" >/dev/null || return 1
-  [ "$imode" = "$(jq -r '.interactionMode // "default"' <<<"$THREAD")" ] || dispatch "$(jq -cn --arg tid "$TID" --arg m "$imode" --arg cid "$(uuid)" \
-    '{type:"thread.interaction-mode.set", commandId:$cid, threadId:$tid, interactionMode:$m}')" >/dev/null || return 1
-  # A message to a busy thread queues behind the active run (never steers it).
-  local dmode='{"type":"start_immediately"}'
-  [ "$(jq -r '.activeRunId // empty' <<<"$THREAD")" = "" ] || dmode='{"type":"queue_after_active"}'
-  local command; command=$(turn_json "$TID" "$text" "$dmode" "$msel")
-  dispatch "$command" >/dev/null || return 1
-  local visible state turn_id; visible=$(wait_turn_visible "$TID" "$(jq -r .messageId <<<"$command")")
-  turn_id=${visible%% *}; state=${visible#* }
+  [ -n "$dispatch_id" ] || dispatch_id=$(uuid)
+  # Mode changes are thread state MCP will not set: legacy path, before the message.
+  if [ "$mode" != "$cur_mode" ] || [ "$imode" != "$cur_imode" ]; then
+    legacy_set_modes "$TID" "$([ "$mode" != "$cur_mode" ] && echo "$mode")" "$([ "$imode" != "$cur_imode" ] && echo "$imode")" || exit 1
+  fi
+  [ -z "$msel" ] || mcp call t3_thread_configure "$(jq -cn --arg t "$TID" --argjson m "$msel" '{threadId:$t, modelSelection:$m}')" >/dev/null || exit 1
+  local sent state
+  sent=$(send_message "$TID" "$text" "$dispatch_id") || exit 1
+  state=$(turn_of "$(jq -r 'if .runId == null then "" else .status end' <<<"$sent")")
   exec 8>&-   # new run visible (or given up on): next sender may check
-  jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --arg turn_id "$turn_id" --arg old "$old" --arg message_id "$(jq -r .messageId <<<"$command")" --arg dispatch_id "$(jq -r .commandId <<<"$command")" \
-    '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $turn_id end), previousTurnId:$old, dispatchId:$dispatch_id, messageId:$message_id}' | register_events
+  jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --argjson sent "$sent" --arg old "$old" --arg dispatch_id "$dispatch_id" \
+    '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $sent.runId end),
+      previousTurnId:$old, dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_events
 }
 
 cmd_answer() {
   [ "$#" -eq 4 ] && [ "$3" = --answers-file ] || die "usage: t3ctl answer <thread> <requestId> --answers-file <path|->"
-  local thread=$1 request=$2 answers command
+  local thread=$1 request=$2 answers
   answers=$(cat -- "$4") || die "cannot read answers file"
-  jq -e 'type == "object"' >/dev/null <<<"$answers" || die "answers must be a JSON object keyed by question id"
+  jq -e 'type == "object"' >/dev/null <<<"$answers" 2>/dev/null || die "answers must be a JSON object keyed by question id"
   resolve_thread "$thread"
-  thread_detail "$TID" 1 | jq -e --arg request "$request" '.thread.userInputs | any(.requestId == $request)' >/dev/null ||
-    die "request is not pending on this thread"
-  command=$(printf '%s' "$answers" | jq -c --arg tid "$TID" --arg rid "$request" --arg cid "$(uuid)" '
-    {type:"runtime-request.respond", commandId:$cid, threadId:$tid, requestId:$rid, answers:.}')
-  dispatch "$command"
+  mcp_raw call t3_pending_request "$(jq -cn --arg t "$TID" --arg r "$request" '{action:"read", threadId:$t, requestId:$r}')" \
+    || die "request is not pending on this thread"
+  jq -c --arg t "$TID" --arg r "$request" '{action:"respond", threadId:$t, requestId:$r, answers:.}' <<<"$answers" \
+    | mcp call t3_pending_request - || exit 1
+  echo
 }
 
 cmd_show() {
@@ -642,14 +708,19 @@ cmd_show() {
   esac; done
   [ -n "$thread" ] || die "usage: t3ctl show <thread> [-n turns]"
   resolve_thread "$thread"
-  thread_detail "$TID" "$turns" | jq --argjson cap "$TEXT_CAP" --argjson shell "$THREAD" '
-    .thread | {id, title, mode: .runtimeMode, interaction: .interactionMode,
-      session: $shell.session,
-      latestTurn,
-      userInputs,
-      approvals,
+  local d ui='[]' ap
+  d=$(mcp messages "$TID" --runs "$turns" --cap "$TEXT_CAP" --with-error) || exit 1
+  if jq -e '.thread.hasPendingUserInput' >/dev/null <<<"$d"; then ui=$(mcp user-inputs "$TID") || exit 1; fi
+  # The exact command behind an approval needs item correlation MCP lacks.
+  ap=$(legacy_thread_detail "$TID" | jq -c '.thread.approvals') || exit 1
+  jq --argjson cap "$TEXT_CAP" --argjson ui "$ui" --argjson ap "$ap" '
+    .thread as $t | {id: $t.id, title: $t.title, mode: $t.runtimeMode, interaction: $t.interactionMode,
+      session: $t.session,
+      latestTurn: $t.latestTurn,
+      userInputs: $ui,
+      approvals: $ap,
       messages: [.messages[] | {role, createdAt,
-                  text: (if $cap > 0 and (.text|length) > $cap then (.text[:$cap] + "…[truncated]") else .text end)}]}'
+                  text: (if $cap > 0 and (.text|length) > $cap then (.text[:$cap] + "…[truncated]") else .text end)}]}' <<<"$d"
 }
 
 cmd_last() {
@@ -664,18 +735,17 @@ cmd_last() {
   esac; done
   [ -n "$thread" ] || die "usage: t3ctl last <thread> [--json]"
   resolve_thread "$thread"
-  local out; out=$(thread_detail "$TID" 4 | jq -c '.thread
-    | {threadId: .id, turnId: (.latestTurn.turnId // null), turn: (.latestTurn.state // "none"),
-       text: ([.messages[] | select(.role == "assistant")] | last | .text // null)}')
+  local out; out=$(mcp messages "$TID" --runs 4) || exit 1
+  out=$(jq -c '{threadId: .thread.id, turnId: (.thread.latestTurn.turnId // null), turn: (.thread.latestTurn.state // "none"),
+       text: ([.messages[] | select(.role == "assistant")] | last | .text // null)}' <<<"$out")
   if [ "$json" = true ]; then printf '%s\n' "$out"; return; fi
   jq -e '.text != null' >/dev/null <<<"$out" || die "thread $TID has no assistant reply in its recent turns"
   jq -j '.text' <<<"$out"; echo
 }
 
 cmd_search() {
-  # Title hits from the live shell, message hits from the server's own
-  # orchestration.searchThreads RPC (V2 exposes it; V1 needed t3's SQLite).
-  local q="" limit=20
+  # t3_thread_search: titles (and branch/PR/project) first, then message text.
+  local q="" limit=20 rows
   while [ $# -gt 0 ]; do case $1 in
     --limit) num --limit "${2:-}"; limit=$2; shift 2;;
     -*) die "unknown flag $1";;
@@ -683,126 +753,23 @@ cmd_search() {
   esac; done
   [ ${#q} -ge 2 ] || die "usage: t3ctl search \"<text>\" (min 2 chars)"
   [ ${#q} -le 200 ] || die "search text is limited to 200 chars"
-  SNAP=$(shell_snap)
-
-  local titles rows
-  titles=$(jq -c --arg q "$q" '
-    .projects as $ps
-    | [.threads[] | select(.archivedAt == null)
-       | select(.title | ascii_downcase | contains($q | ascii_downcase))
-       | {threadId: .id, title,
-          project: (.projectId as $p | ($ps[] | select(.id == $p) | .title)),
-          matchedIn: "title", snippet: .title,
-          updatedAt}]' <<<"$SNAP")
-  rows=$(rpc orchestration.searchThreads "$(jq -cn --arg q "$q" --argjson l "$(( limit > 50 ? 50 : (limit < 1 ? 1 : limit) ))" '{query:$q, limit:$l}')" | jq -c '.matches') || exit 1
-
-  # Merge: title hits first, then message hits for threads not already listed.
-  # The snapshot goes in on stdin — it can exceed the argv size limit.
-  jq -cn --argjson titles "$titles" --argjson msgs "$rows" --argjson limit "$limit" '
-    input as $snap
-    | ($snap.projects | map({(.id): .title}) | add // {}) as $pt
-    | ($snap.threads | map({(.id): .}) | add // {}) as $tt
-    | ($titles | map(.threadId)) as $seen
-    | $titles
-      + [ $msgs[] | select(.threadId as $id | $seen | index($id) | not)
-          | . as $m | $tt[$m.threadId] as $t
-          | select($t != null and $t.archivedAt == null)
-          | {threadId: $m.threadId, title: $t.title,
-             project: $pt[$t.projectId], matchedIn: $m.source,
-             snippet: $m.snippet, messageCreatedAt: $m.messageCreatedAt,
-             updatedAt: $t.updatedAt} ]
-    | .[:$limit] | .[]' <<<"$SNAP"
+  rows=$(mcp search "$q" --limit "$(( limit > 50 ? 50 : (limit < 1 ? 1 : limit) ))") || exit 1
+  load_projects
+  jq -c --argjson ps "$PROJECTS" --argjson limit "$limit" '
+    ($ps | map({(.id): .title}) | add // {}) as $pt
+    | [.[] | {threadId, title, project: ($pt[.projectId] // null), matchedIn: .source, snippet}
+             + (if .messageCreatedAt then {messageCreatedAt} else {} end) + {updatedAt}]
+    | .[:$limit] | .[]' <<<"$rows"
 }
 
 cmd_approvals() {
   [ $# -ge 1 ] || die "usage: t3ctl approvals <thread>"
   resolve_thread "$1"
-  thread_detail "$TID" 8 | jq -c '.thread.approvals[]'
-}
-
-cmd_approve() {
-  local thread=${1:-} rid=${2:-} decision=${3:-accept}
-  [ -n "$thread" ] && [ -n "$rid" ] || die "usage: t3ctl approve <thread> <requestId> [accept|acceptForSession|acceptAlways|decline|cancel]"
-  case $decision in accept|acceptForSession|acceptAlways|decline|cancel) ;; *)
-    die "invalid decision '$decision'";; esac
-  resolve_thread "$thread"
-  dispatch "$(jq -cn --arg tid "$TID" --arg rid "$rid" --arg d "$decision" --arg cid "$(uuid)" '
-    {type:"runtime-request.respond", commandId:$cid, threadId:$tid, requestId:$rid, decision:$d}')" >/dev/null
-  jq -cn --arg id "$TID" --arg rid "$rid" --arg d "$decision" \
-    '{threadId:$id, requestId:$rid, decision:$d, responded:true}'
-}
-
-# The callback contract asks the session to run `$NOTIFY_CMD`, but in
-# approval-required mode (the default for owned threads) running ANY command
-# raises an approval — so an unattended thread could never report "done" or
-# "waiting on approval" without someone approving the report itself (found
-# 2026-09-08 via a probe thread). This accepts exactly that one command, in
-# owned threads only, and nothing else: the detail must be a single notify invocation
-# for the SAME thread id with a double-quoted summary free of shell syntax.
-# Anything looser (another command chained on, backticks, $(), redirects)
-# does not match and waits for a human/Cactus like before.
-callback_pattern() { # $1 thread id → ERE for the approval detail
-  local tid=$1
-  # optional wrappers: codex shows `/usr/bin/bash -lc '<cmd>'`, claude shows
-  # the bare command (sometimes `Bash: <cmd>`); summary = [^"'`$;&|<>\\]*
-  printf '%s' "^((/usr/bin/)?bash -lc '|Bash: |Run: )?$NOTIFY_CMD --thread $tid --status (done|blocked|approval) \"[^\"'\`\$;&|<>\\\\]*\"'?\$"
-}
-
-approve_callbacks_once() { # $1 dry-run true/false → prints one JSON line per action
-  local dry=$1 snap threads tid title detail rid pending pat
-  snap=$(shell_snap)
-  threads=$(jq -c --arg tag "$TAG" '.threads[] | select(.archivedAt == null and .hasPendingApprovals
-             and (.title | startswith($tag))) | {id, title}' <<<"$snap")
-  [ -n "$threads" ] || return 0
-  while IFS= read -r t; do
-    tid=$(jq -r .id <<<"$t"); title=$(jq -r .title <<<"$t")
-    # pending = requested requestIds that have no "resolved" activity yet
-    # pending = runtime requests still open; detail is the exact command (or
-    # null when it cannot be tied to one — then it is left for a human)
-    pending=$(thread_detail "$tid" 2 | jq -c '
-      .thread.approvals[] | select(.payload.status == "pending")
-      | {requestId: .payload.requestId, requestType: .payload.requestType, detail: (.payload.detail // "")}')
-    [ -n "$pending" ] || continue
-    pat=$(callback_pattern "$tid")
-    while IFS= read -r a; do
-      rid=$(jq -r .requestId <<<"$a"); detail=$(jq -r .detail <<<"$a")
-      if [ "$(jq -r .requestType <<<"$a")" = command_execution_approval ] && [[ $detail =~ $pat ]]; then
-        if [ "$dry" = true ]; then
-          jq -cn --arg tid "$tid" --arg title "$title" --arg rid "$rid" --arg d "$detail" \
-            '{threadId:$tid, title:$title, requestId:$rid, detail:$d, action:"would-accept"}'
-        else
-          dispatch "$(jq -cn --arg tid "$tid" --arg rid "$rid" --arg cid "$(uuid)" '
-            {type:"runtime-request.respond", commandId:$cid, threadId:$tid,
-             requestId:$rid, decision:"accept"}')" >/dev/null
-          jq -cn --arg tid "$tid" --arg title "$title" --arg rid "$rid" --arg d "$detail" --arg at "$(now)" \
-            '{threadId:$tid, title:$title, requestId:$rid, detail:$d, action:"accepted", at:$at}'
-        fi
-      else
-        jq -cn --arg tid "$tid" --arg title "$title" --arg rid "$rid" --arg d "$detail" \
-          '{threadId:$tid, title:$title, requestId:$rid, detail:$d, action:"left-for-human"}'
-      fi
-    done <<<"$pending"
-  done <<<"$threads"
-}
-
-cmd_approve_callbacks() {
-  local loop=0 dry=false
-  while [ $# -gt 0 ]; do case $1 in
-    --loop) num --loop "${2:-}"; loop=$2; shift 2;;
-    --dry-run) dry=true; shift;;
-    *) die "usage: t3ctl approve-callbacks [--loop seconds] [--dry-run]";;
-  esac; done
-  if [ "$loop" -le 0 ]; then approve_callbacks_once "$dry"; return; fi
-  # Service mode: one failed pass (t3 restarting, token rotating) must not
-  # kill the loop — `die` exits the subshell only.
-  while :; do
-    ( approve_callbacks_once "$dry" ) || echo "approve-callbacks: pass failed (t3 down or token rotating?); retrying in ${loop}s" >&2
-    sleep "$loop"
-  done
+  legacy_approvals "$TID"
 }
 
 cmd_watch() {
-  local thread="" timeout=900 interval=5 after_turn="" message_id="" expected_turn=""
+  local thread="" timeout=900 interval=5 after_turn="" message_id="" expected_turn="" latest
   while [ $# -gt 0 ]; do case $1 in
     --message-id) [ -n "${2:-}" ] || die "--message-id requires a message id"; message_id=$2; shift 2;;
     --after-turn) [ -n "${2:-}" ] || die "--after-turn requires a turn id"; after_turn=$2; shift 2;;
@@ -813,26 +780,23 @@ cmd_watch() {
   esac; done
   [ -n "$thread" ] || die "usage: t3ctl watch <thread> [--message-id ID] [--timeout s]"
   resolve_thread "$thread"
-  local deadline=$((SECONDS + timeout)) grace=$((SECONDS + 60)) reason="" t state
+  local deadline=$((SECONDS + timeout)) grace=$((SECONDS + 60)) reason="" t=$THREAD state slice
   while :; do
+    latest=$(jq -r '.latestTurn.turnId // "none"' <<<"$t")
     if [ -n "$message_id" ]; then
-      # the run this message started (V2 runs record their userMessageId)
-      expected_turn=$(thread_detail "$TID" 1 | jq -r --arg m "$message_id" \
-        '[.thread.runs[] | select(.userMessageId == $m)] | if length > 1 then error("message maps to several runs") else (last.id // "none") end') || return 1
-    fi
-    t=$(shell_snap | jq -c --arg id "$TID" '.threads[] | select(.id == $id)')
-    [ -n "$t" ] || die "thread $TID disappeared"
-    if [ -n "$message_id" ]; then
+      # the run this message started (T3's user-message item records its run)
+      expected_turn=$(mcp run-of-message "$TID" "$message_id") || exit 1
+      expected_turn=$(jq -r '.runId // "none"' <<<"$expected_turn")
       if [ "$expected_turn" = none ]; then
         [ $SECONDS -ge $deadline ] && { reason=not-visible; break; }
-        sleep "$interval"
+        sleep "$interval"; t=$(mcp thread "$TID") || exit 1
         continue
       fi
-      [ "$(jq -r '.latestTurn.turnId // "none"' <<<"$t")" = "$expected_turn" ] || { reason=superseded; break; }
+      [ "$latest" = "$expected_turn" ] || { reason=superseded; break; }
     fi
-    if [ -n "$after_turn" ] && [ "$(jq -r '.latestTurn.turnId // "none"' <<<"$t")" = "$after_turn" ]; then
+    if [ -n "$after_turn" ] && [ "$latest" = "$after_turn" ]; then
       [ $SECONDS -ge $deadline ] && { reason=not-visible; break; }
-      sleep "$interval"
+      sleep "$interval"; t=$(mcp thread "$TID") || exit 1
       continue
     fi
     if jq -e '.hasPendingApprovals' >/dev/null <<<"$t"; then reason=pending-approval; break; fi
@@ -846,27 +810,45 @@ cmd_watch() {
       reason=settled; break
     fi
     [ $SECONDS -ge $deadline ] && { reason=timeout; break; }
-    sleep "$interval"
+    if [ "$state" = running ]; then
+      # Block server-side until the run ends. t3_thread_wait does not return
+      # for a pending approval or question, so wait in slices and look again.
+      slice=$((deadline - SECONDS)); [ $slice -gt "$WATCH_SLICE" ] && slice=$WATCH_SLICE; [ $slice -lt 1 ] && slice=1
+      mcp call t3_thread_wait "$(jq -cn --arg t "$TID" --arg r "$latest" --argjson ms $((slice * 1000)) '{threadId:$t, runId:$r, timeoutMs:$ms}')" \
+        --timeout $((slice + 30)) >/dev/null || exit 1
+    else
+      sleep "$interval"
+    fi
+    t=$(mcp thread "$TID") || exit 1
   done
-  local detail; detail=$(thread_detail "$TID" 1)
-  if [ "$reason" != not-visible ] && [ "$(jq -r '.latestTurn.turnId' <<<"$t")" != "$(jq -r '.thread.latestTurn.turnId' <<<"$detail")" ]; then reason=superseded; fi
-  printf '%s\n%s\n' "$t" "$detail" | jq -s --arg reason "$reason" --argjson cap "$TEXT_CAP" '
+  local d ui='[]' ap='[]'
+  d=$(mcp messages "$TID" --runs 1 --cap "$TEXT_CAP" --with-error) || exit 1
+  if [ "$reason" != not-visible ] && [ "$(jq -r '.latestTurn.turnId' <<<"$t")" != "$(jq -r '.thread.latestTurn.turnId' <<<"$d")" ]; then reason=superseded; fi
+  case $reason in
+    not-visible|superseded) ;;
+    *) if jq -e '.thread.hasPendingUserInput' >/dev/null <<<"$d"; then ui=$(mcp user-inputs "$TID") || exit 1; fi;;
+  esac
+  case $reason in
+    pending-approval|pending-user-input)
+      if jq -e '.thread.hasPendingApprovals' >/dev/null <<<"$d"; then
+        ap=$(legacy_thread_detail "$TID" | jq -c '[.thread.approvals[] | select(.payload.status == "pending")]') || exit 1
+      fi;;
+  esac
+  printf '%s\n%s\n' "$t" "$d" | jq -s --arg reason "$reason" --argjson cap "$TEXT_CAP" --argjson ui "$ui" --argjson ap "$ap" '
     .[0] as $t | .[1] as $d |
-    {turnId: $t.latestTurn.turnId, userInputs: (if $reason == "not-visible" or $reason == "superseded" then [] else $d.thread.userInputs end), reason: $reason,
+    {turnId: $t.latestTurn.turnId, userInputs: $ui, reason: $reason,
      turn: (if $reason == "superseded" then "superseded" else ($t.latestTurn.state // "none") end),
-     lastError: ($t.session.lastError // null),
-     approvals: (if $reason == "pending-approval" or $reason == "pending-user-input"
-                 then [$d.thread.approvals[] | select(.payload.status == "pending")]
-                 else [] end),
-     lastAssistant: (if $reason == "not-visible" or $reason == "superseded" then null else ([$d.thread.messages[] | select(.role == "assistant")] | last
+     lastError: ($d.thread.session.lastError // null),
+     approvals: $ap,
+     lastAssistant: (if $reason == "not-visible" or $reason == "superseded" then null else ([$d.messages[] | select(.role == "assistant")] | last
                      | if . == null then null
                        elif $cap > 0 and (.text|length) > $cap then (.text[:$cap] + "…[truncated]")
                        else .text end) end)}'
 }
 
-simple_thread_cmd() { # $1: interrupt|stop|rm, then thread + flags
+simple_thread_cmd() { # $1: interrupt|stop|rm|settle|unsettle, then thread + flags
   local name=$1; shift
-  local thread="" force=false
+  local thread="" force=false out
   while [ $# -gt 0 ]; do case $1 in
     --force) force=true; shift;;
     -*) die "unknown flag $1";;
@@ -878,28 +860,16 @@ simple_thread_cmd() { # $1: interrupt|stop|rm, then thread + flags
   # ownership guard. The server still refuses to settle a thread that is
   # running or blocked on an approval/user-input request.
   case $name in settle|unsettle) ;; *) require_ours_or_force "$force";; esac
+  local run; run=$(jq -r '.activeRunId // empty' <<<"$THREAD")
   case $name in
-    settle) dispatch "$(jq -cn --arg tid "$TID" --arg cid "$(uuid)" \
-      '{type:"thread.settle", commandId:$cid, threadId:$tid}')" >/dev/null;;
-    unsettle) dispatch "$(jq -cn --arg tid "$TID" --arg cid "$(uuid)" \
-      '{type:"thread.unsettle", commandId:$cid, threadId:$tid, reason:"user"}')" >/dev/null;;
+    settle|unsettle)
+      mcp call t3_thread_organize "$(jq -cn --arg t "$TID" --arg a "$name" '{threadId:$t, action:$a}')" >/dev/null || exit 1;;
     interrupt)
-      local run; run=$(jq -r '.activeRunId // empty' <<<"$THREAD")
       [ -n "$run" ] || die "thread has no active run to interrupt"
-      dispatch "$(jq -cn --arg tid "$TID" --arg run "$run" --arg cid "$(uuid)" \
-        '{type:"run.interrupt", commandId:$cid, threadId:$tid, runId:$run}')" >/dev/null;;
-    stop)
-      # V2 has no session-stop command: interrupt the active run, then detach
-      # every provider session that is still live.
-      local run sid; run=$(jq -r '.activeRunId // empty' <<<"$THREAD")
-      [ -z "$run" ] || dispatch "$(jq -cn --arg tid "$TID" --arg run "$run" --arg cid "$(uuid)" \
-        '{type:"run.interrupt", commandId:$cid, threadId:$tid, runId:$run}')" >/dev/null
-      for sid in $(api GET "/api/orchestration/threads/$TID/bounded" | jq -r '.projection.providerSessions[] | select(.status != "stopped") | .id'); do
-        dispatch "$(jq -cn --arg tid "$TID" --arg sid "$sid" --arg cid "$(uuid)" \
-          '{type:"provider-session.detach", commandId:$cid, threadId:$tid, providerSessionId:$sid, reason:"t3ctl stop"}')" >/dev/null
-      done;;
-    rm) dispatch "$(jq -cn --arg tid "$TID" --arg cid "$(uuid)" \
-      '{type:"thread.delete", commandId:$cid, threadId:$tid}')" >/dev/null;;
+      out=$(mcp call t3_thread_interrupt "$(jq -cn --arg t "$TID" --arg r "$run" '{threadId:$t, runId:$r}')") || exit 1
+      [ "$(jq -r .status <<<"$out")" != no_active_run ] || die "thread has no active run to interrupt";;
+    stop) legacy_stop "$TID" "$run" || exit 1;;
+    rm) legacy_rm "$TID" || exit 1;;
   esac
   jq -cn --arg id "$TID" --arg op "$name" '{threadId:$id, op:$op, done:true}'
 }
@@ -907,93 +877,63 @@ simple_thread_cmd() { # $1: interrupt|stop|rm, then thread + flags
 cmd_token() {
   case ${1:-status} in
     status)
+      local code="" mvalid=false
       if [ -s "$TOKEN_FILE" ]; then
-        local code
         code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' \
           -H "Authorization: Bearer $(tr -d ' \t\n' < "$TOKEN_FILE")" -H "$PROTO_HDR" "$BASE/api/orchestration/shell" || echo 000)
-        jq -cn --arg f "$TOKEN_FILE" --arg sid "$(cat "$SESSION_FILE" 2>/dev/null)" --arg code "$code" --arg mode "$TOKEN_MODE" \
-          '{tokenFile:$f, sessionId:($sid // null), probe:($code|tonumber), valid:($code=="200"), mode:$mode}'
-      else
-        jq -cn --arg f "$TOKEN_FILE" --arg mode "$TOKEN_MODE" '{tokenFile:$f, sessionId:null, probe:null, valid:false, mode:$mode}'
-      fi;;
+      fi
+      [ -s "$MCP_TOKEN_FILE" ] && probe_token mcp "$(tr -d ' \t\n' < "$MCP_TOKEN_FILE")" && mvalid=true
+      jq -cn --arg f "$TOKEN_FILE" --arg sid "$(cat "$SESSION_FILE" 2>/dev/null)" --arg code "$code" --arg mode "$TOKEN_MODE" \
+             --arg mf "$MCP_TOKEN_FILE" --arg msid "$(cat "$MCP_SESSION_FILE" 2>/dev/null)" --argjson mvalid "$mvalid" --arg access "$MCP_ACCESS" '
+        {tokenFile:$f, sessionId:$sid,
+         probe:(if $code == "" then null else ($code|tonumber) end), valid:($code=="200"), mode:$mode,
+         mcp:{tokenFile:$mf, sessionId:$msid, valid:$mvalid, access:$access}}';;
     renew)
-      [ "$TOKEN_MODE" = self ] || die "T3CTL_TOKEN_MODE=$TOKEN_MODE: this box rotates the token with t3-token-renew (systemctl start t3-token-renew)"
-      mint_token "$(tr -d ' \t\n' < "$TOKEN_FILE" 2>/dev/null)" || exit 1
-      jq -cn --arg f "$TOKEN_FILE" --arg sid "$(cat "$SESSION_FILE" 2>/dev/null)" '{tokenFile:$f, sessionId:$sid, renewed:true}';;
+      [ "$TOKEN_MODE" = self ] || die "T3CTL_TOKEN_MODE=$TOKEN_MODE: this box rotates the tokens with t3-token-renew (systemctl start t3-token-renew)"
+      mint_token rpc "$(tr -d ' \t\n' < "$TOKEN_FILE" 2>/dev/null)" || exit 1
+      mint_token mcp "$(tr -d ' \t\n' < "$MCP_TOKEN_FILE" 2>/dev/null)" || exit 1
+      jq -cn --arg f "$TOKEN_FILE" --arg sid "$(cat "$SESSION_FILE" 2>/dev/null)" \
+             --arg mf "$MCP_TOKEN_FILE" --arg msid "$(cat "$MCP_SESSION_FILE" 2>/dev/null)" \
+        '{tokenFile:$f, sessionId:$sid, renewed:true, mcp:{tokenFile:$mf, sessionId:$msid, renewed:true}}';;
     *) die "usage: t3ctl token [status|renew]";;
   esac
 }
 
-cmd_project() {
-  case ${1:-} in
-    add)
-      shift
-      local path="" title=""
-      while [ $# -gt 0 ]; do case $1 in
-        --title) title=$2; shift 2;;
-        -*) die "unknown flag $1";;
-        *) [ -z "$path" ] && path=$1 || die "unexpected arg: $1"; shift;;
-      esac; done
-      [ -n "$path" ] || die "usage: t3ctl project add <path> [--title T]"
-      [ -d "$path" ] || die "no such directory: $path"
-      [ -n "$title" ] || title=$(basename "$path")
-      SNAP=$(shell_snap)
-      local existing
-      existing=$(jq -c --arg r "$path" '.projects[] | select(.workspaceRoot == $r) | {id, title, workspaceRoot}' <<<"$SNAP")
-      if [ -n "$existing" ]; then jq -c '. + {created:false}' <<<"$existing"; return; fi
-      local pid; pid=$(uuid)
-      rpc projects.mutate "$(jq -cn --arg pid "$pid" --arg title "$title" --arg root "$path" --arg cid "$(uuid)" '
-        {type:"project.create", commandId:$cid, projectId:$pid, title:$title, workspaceRoot:$root}')" >/dev/null
-      jq -cn --arg pid "$pid" --arg title "$title" --arg root "$path" '{id:$pid, title:$title, workspaceRoot:$root, created:true}';;
-    set-model)
-      local project=${2:-} sel=${3:-}
-      [ -n "$project" ] && [ -n "$sel" ] || die "usage: t3ctl project set-model <project> <instanceId>:<model>"
-      case $sel in *:*) ;; *) die "model must be instanceId:model (e.g. claudeAgent:claude-opus-5-5)";; esac
-      resolve_project "$project"
-      rpc projects.mutate "$(jq -cn --arg pid "$PID" --arg i "${sel%%:*}" --arg mo "${sel#*:}" --arg cid "$(uuid)" '
-        {type:"project.update", commandId:$cid, projectId:$pid,
-         defaultModelSelection:{instanceId:$i, model:$mo}}')" >/dev/null
-      jq -cn --arg pid "$PID" --arg i "${sel%%:*}" --arg mo "${sel#*:}" \
-        '{projectId:$pid, defaultModelSelection:{instanceId:$i, model:$mo}}';;
-    *) die "usage: t3ctl project add <path> [--title T] | set-model <project> <instanceId>:<model>";;
-  esac
-}
-
 cmd_contract_check() {
-  # Every internal contract this script depends on, exercised read-only, so a
-  # t3 version bump fails here instead of inside a thread. Extend when a new
-  # endpoint/field is used. Complements `selftest` (end-to-end, costs a turn).
-  local raw snap n tid
-  raw=$(api GET /api/orchestration/shell) || exit 1
-  jq -e '(.projects | type == "array") and (.threads | type == "array") and (.archivedThreads | type == "array")' >/dev/null <<<"$raw" \
-    || die "V2 shell snapshot shape changed (projects/threads/archivedThreads)"
-  n=$(jq -r '.projects | length' <<<"$raw")
-  if [ "$n" -gt 0 ]; then
-    jq -e '.projects[0] | has("id") and has("title") and has("workspaceRoot") and has("defaultModelSelection")' >/dev/null <<<"$raw" || die "project shape changed"
-  fi
-  tid=$(jq -r '.threads[0].id // empty' <<<"$raw")
+  # Every contract this build depends on, exercised read-only, so a t3
+  # version bump fails here instead of inside a thread. Extend when a new
+  # tool/endpoint/field is used. Complements `selftest` (end-to-end, costs a turn).
+  local probe tl tid rd meta legacy
+  mcp_raw probe --t3ctl
+  case $MCP_RC in
+    0) probe=$MCP_OUT;;
+    1) die "T3's MCP endpoint lacks tools t3ctl calls: $(jq -r '.missing | join(", ")' <<<"$MCP_OUT") (server $(jq -r '.serverInfo.version // "?"' <<<"$MCP_OUT")) — see docs/COMPAT.md";;
+    *) mcp_fail "MCP initialize/tools/list";;
+  esac
+  tl=$(mcp call t3_thread_list '{"allProjects":true,"limit":1}') || exit 1
+  jq -e '(.threads | type == "array") and has("nextCursor") and has("total")' >/dev/null <<<"$tl" || die "t3_thread_list result shape changed"
+  tid=$(jq -r '.threads[0].threadId // empty' <<<"$tl")
   if [ -n "$tid" ]; then
-    jq -e '.threads[0] | has("latestRunId") and has("activeRunId") and has("status") and has("pendingRuntimeRequest")
-             and has("runtimeMode") and has("interactionMode") and has("settledOverride") and has("archivedAt")' >/dev/null <<<"$raw" \
-      || die "V2 thread shell fields changed (latestRunId/activeRunId/status/pendingRuntimeRequest/…)"
-    api GET "/api/orchestration/threads/$tid/bounded" | jq -e '.projection
-        | (.runs | type == "array") and (.runtimeRequests | type == "array") and (.messages | type == "array")
-          and (.turnItems | type == "array") and (.providerSessions | type == "array") and (.thread | has("runtimeMode"))' >/dev/null \
-      || die "V2 bounded thread snapshot shape changed"
+    jq -e '.threads[0] | has("latestRunId") and has("status") and has("runtimeMode") and has("interactionMode")
+             and has("settled") and has("snoozedUntil") and has("updatedAt") and has("providerInstanceId") and has("model")' >/dev/null <<<"$tl" \
+      || die "t3_thread_list thread fields changed (latestRunId/status/runtimeMode/settled/…)"
+    rd=$(mcp call t3_thread_read "$(jq -cn --arg t "$tid" '{threadId:$t, limit:2, maxCharsPerItem:1}')") || exit 1
+    jq -e '(.thread | has("latestRunId") and has("activeRunId") and has("pendingRequestCount") and has("itemCount") and has("archived"))
+           and (.recentRuns | type == "array") and (.items | type == "array") and has("nextPosition") and has("hasMore")
+           and ((.items[0] // {runId:null, type:"", messageId:null, textTruncated:false, updatedAt:""}) | has("runId") and has("type") and has("textTruncated"))' >/dev/null <<<"$rd" \
+      || die "t3_thread_read result shape changed (thread/recentRuns/items)"
   fi
-  # The WebSocket RPC leg: protocol, auth and the search RPC (read-only).
-  rpc orchestration.searchThreads '{"query":"t3ctl-contract-check","limit":1}' | jq -e '.matches | type == "array"' >/dev/null \
-    || die "orchestration.searchThreads result shape changed"
-  local db_checked=false
-  if command -v sqlite3 >/dev/null && [ -r "$DB" ]; then
-    # bin/t3-events correlates dispatches with runs here, read-only
-    sqlite3 -readonly "$DB" "SELECT run_id, thread_id, ordinal, json_extract(payload_json, '\$.userMessageId') FROM orchestration_v2_projection_runs LIMIT 0;" >/dev/null 2>&1 \
-      || die "run-correlation SQL schema changed (orchestration_v2_projection_runs) — see docs/COMPAT.md"
-    db_checked=true
-  fi
-  jq -cn --arg base "$BASE" --argjson projects "$n" --argjson threads "$(jq '.threads|length' <<<"$raw")" \
-         --arg db "$DB" --argjson dbc "$db_checked" \
-    '{ok:true, base:$base, projects:$projects, threads:$threads, rpc:true, db:$db, dbSchemaChecked:$dbc}'
+  # Minting the MCP credential uses T3's OAuth endpoints (the approval
+  # itself needs a pairing code, so only the metadata is checked here).
+  meta=$(curl -sf -m 15 "$BASE/.well-known/oauth-authorization-server") || die "GET /.well-known/oauth-authorization-server failed: the MCP credential cannot be re-minted"
+  jq -e '(.registration_endpoint | test("/oauth/mcp/register$")) and (.token_endpoint | test("/oauth/mcp/token$"))
+         and (.grant_types_supported | index("authorization_code")) and (.code_challenge_methods_supported | index("S256"))' >/dev/null <<<"$meta" \
+    || die "MCP OAuth metadata changed (register/token endpoints, authorization_code, S256)"
+  legacy=$(legacy_contract_check) || exit 1
+  jq -cn --arg base "$BASE" --argjson probe "$probe" --argjson legacy "$legacy" \
+    '{ok:true, base:$base} + $legacy
+     + {mcp:{server:$probe.serverInfo.version, protocolVersion:$probe.protocolVersion, tools:$probe.tools,
+             required:$probe.required, missing:$probe.missing}, oauth:true}'
 }
 
 cmd_selftest() {
@@ -1006,8 +946,8 @@ cmd_selftest() {
     --project) project=$2; shift 2;;
     *) die "usage: t3ctl selftest [--project <project>]";;
   esac; done
-  SNAP=$(shell_snap)
-  [ -n "$project" ] || project=$(jq -r '.projects[0].title // empty' <<<"$SNAP")
+  load_projects
+  [ -n "$project" ] || project=$(jq -r '.[0].title // empty' <<<"$PROJECTS")
   [ -n "$project" ] || die "selftest: no project on this server"
   command -v "$NOTIFY_BIN" >/dev/null 2>&1 || die "selftest: $NOTIFY_BIN is not installed — the callback leg cannot work"
 
@@ -1015,10 +955,10 @@ cmd_selftest() {
   # The probe is always approval-required, whatever the deployment default:
   # in full-access the callback never raises an approval, so the approver
   # leg this exists to prove would go untested.
-  w=$(DEFAULT_MODE=approval-required MODE_FIXED="" cmd_new "$project" "Connectivity self-test. Reply with exactly the word PONG and nothing else. Do not run tools, do not read or edit files." --title "selftest $(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  w=$(DEFAULT_MODE=approval-required MODE_FIXED="" cmd_new "$project" "Connectivity self-test. Reply with exactly the word PONG and nothing else. Do not run tools, do not read or edit files." --title "selftest $(date -u +%Y-%m-%dT%H:%M:%SZ)") || die "selftest: new failed"
   tid=$(jq -r .threadId <<<"$w")
   echo "selftest: thread $tid" >&2
-  SNAP=""; w=$(cmd_watch "$tid" --timeout 120)
+  w=$(cmd_watch "$tid" --timeout 120)
   reason=$(jq -r .reason <<<"$w")
   # Some models run the callback right after PONG (the footer asks for it on
   # completion). That pending approval is the approver's to accept — keep
@@ -1026,7 +966,7 @@ cmd_selftest() {
   local deadline=$((SECONDS + 150))
   while [ "$reason" = pending-approval ] || [ "$reason" = timeout ]; do
     [ $SECONDS -ge $deadline ] && break
-    SNAP=""; w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
+    w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
   done
   ans=$(jq -r '.lastAssistant // ""' <<<"$w")
   if [ "$reason" = settled ] && [[ $ans == *PONG* ]]; then pong_s=$((SECONDS - t0)); else fail=1; echo "selftest: PONG leg failed ($reason): $w" >&2; fi
@@ -1035,16 +975,16 @@ cmd_selftest() {
   # accepted it, the callback leg is proven — do not force a second one.
   local early_acc=0
   if [ $fail -eq 0 ]; then
-    SNAP=""; early_acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
+    early_acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
   fi
   if [ $fail -eq 0 ] && [ "$early_acc" -ge 1 ]; then
     cb_s="0"; echo "selftest: callback already made and auto-approved during the PONG leg" >&2
   elif [ $fail -eq 0 ]; then
     t0=$SECONDS
-    SNAP=""; cmd_say "$tid" "Run exactly this command and nothing else: $NOTIFY_BIN --thread $tid --status done \"t3ctl selftest callback\"" >/dev/null
+    cmd_say "$tid" "Run exactly this command and nothing else: $NOTIFY_BIN --thread $tid --status done \"t3ctl selftest callback\"" >/dev/null
     local deadline=$((SECONDS + 150))
     while :; do
-      SNAP=""; w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
+      w=$(cmd_watch "$tid" --timeout 20); reason=$(jq -r .reason <<<"$w")
       [ "$reason" = settled ] && break
       # pending-approval here is expected: the approver takes up to one
       # 15 s cycle. Anything else that is not "still running" is a failure.
@@ -1052,14 +992,14 @@ cmd_selftest() {
       [ $SECONDS -ge $deadline ] && break
     done
     if [ "$reason" = settled ] && [ "$(jq -r '.lastError // ""' <<<"$w")" = "" ]; then
-      SNAP=""; local acc; acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
+      local acc; acc=$(cmd_approvals "$tid" | jq -s '[.[] | select(.payload.decision == "accept")] | length')
       if [ "$acc" -ge 1 ]; then cb_s=$((SECONDS - t0)); else fail=1; echo "selftest: callback settled but no accepted approval found (approver not running?)" >&2; fi
     else
       fail=1; echo "selftest: callback leg failed ($reason): $w" >&2
     fi
   fi
 
-  SNAP=""; simple_thread_cmd rm "$tid" >/dev/null || echo "selftest: could not delete probe thread $tid" >&2
+  ( simple_thread_cmd rm "$tid" >/dev/null ) || echo "selftest: could not delete probe thread $tid" >&2
   jq -cn --arg project "$project" --arg tid "$tid" --arg pong "$pong_s" --arg cb "$cb_s" --argjson ok "$([ $fail -eq 0 ] && echo true || echo false)" \
     '{ok:$ok, project:$project, threadId:$tid,
       pong: (if $pong == "" then "FAILED" else ($pong + "s") end),
