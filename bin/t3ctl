@@ -763,8 +763,14 @@ cmd_say() {
   # Any failure after the first change puts back what was changed: modes
   # first (down again), then the model.
   local set_mode="" set_imode="" model_set=""
-  [ "$mode" = "$cur_mode" ] || set_mode=$mode
-  [ "$imode" = "$cur_imode" ] || set_imode=$imode
+  # An accepted replay only recovers its receipt: the settings it asked for
+  # were applied then, and re-applying them now could undo a later dispatch's.
+  if [ -z "$REPLAY" ]; then
+    [ "$mode" = "$cur_mode" ] || set_mode=$mode
+    [ "$imode" = "$cur_imode" ] || set_imode=$imode
+  else
+    msel=""
+  fi
   say_restore() {
     echo "t3ctl: the message was not sent; restoring the thread's previous settings" >&2
     if [ -n "$set_mode$set_imode" ]; then
@@ -785,7 +791,20 @@ cmd_say() {
     ( legacy_set_modes "$TID" "$set_mode" "$set_imode" ) || { say_restore; exit 1; }
   fi
   local sent state
-  sent=$(send_message "$TID" "$text" "$dispatch_id") || { say_restore; exit 1; }
+  # Only a definite refusal (T3's typed failure, exit 2) proves the message was
+  # not accepted; after a transport error or lost reply it may be running, so
+  # the requested settings stay and the caller is told delivery is uncertain.
+  if ! mcp_raw call t3_thread_send - --retry < <(printf '%s' "$text" | jq -Rsc --arg tid "$TID" --arg rid "$dispatch_id" \
+        '{threadId:$tid, message:., mode:"queue", clientRequestId:$rid}'); then
+    if [ "$MCP_RC" = 2 ]; then
+      local send_rc=$MCP_RC send_err=$MCP_ERR   # say_restore's own calls overwrite them
+      say_restore; MCP_RC=$send_rc; MCP_ERR=$send_err; mcp_fail t3_thread_send
+    fi
+    [ -z "$set_mode$set_imode$model_set" ] || echo "t3ctl: the thread keeps the settings this say asked for (delivery is uncertain, so they were not rolled back)" >&2
+    MCP_ERR="$MCP_ERR — delivery of dispatch $dispatch_id is uncertain: check the thread (t3ctl last $TID) before sending again; a retry with --dispatch-id $dispatch_id cannot duplicate it while the credential is unchanged"
+    mcp_fail t3_thread_send
+  fi
+  sent=$MCP_OUT
   ledger_accept "$dispatch_id"
   state=$(turn_of "$(jq -r 'if .runId == null then "" else .status end' <<<"$sent")")
   exec 8>&-   # new run visible (or given up on): next sender may check

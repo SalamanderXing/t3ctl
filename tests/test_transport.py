@@ -455,6 +455,24 @@ class TransportTest(unittest.TestCase):
         self.assertEqual((self.thread['runtimeMode'], self.thread['interactionMode']), ('approval-required', 'plan'))
         self.assertEqual(self.thread['modelSelection'], {'instanceId': 'codex', 'model': 'test'})
 
+    def test_uncertain_delivery_keeps_the_requested_settings(self):
+        self.thread['runtimeMode'] = 'full-access'
+        self.server.mcp_revoke_after = 't3_thread_send'     # accepted, then the reply is lost
+        out = self.cli('say', 'test-thread', 'Go', '--mode', 'approval-required', success=False)
+        self.assertIn('delivery of dispatch', out.stderr)
+        self.assertNotIn('message was not sent', out.stderr)
+        self.assertEqual(self.thread['runtimeMode'], 'approval-required')   # not rolled back under a running message
+        self.assertEqual(len(self.sent('mcp.t3_thread_send')), 1)
+
+    def test_accepted_replay_does_not_reapply_old_settings(self):
+        a = self.cli('say', 'test-thread', 'A', '--execute', '--model', 'claudeAgent:model-a', '--dispatch-id', 'replay-a-0001')
+        self.cli('say', 'test-thread', 'B', '--plan', '--model', 'claudeAgent:model-b')
+        again = self.cli('say', 'test-thread', 'A', '--execute', '--model', 'claudeAgent:model-a', '--dispatch-id', 'replay-a-0001',
+                         '--expect-turn', 'old')
+        self.assertEqual(again['messageId'], a['messageId'])
+        self.assertEqual((self.thread['interactionMode'], self.thread['modelSelection']['model']), ('plan', 'model-b'))
+        self.assertEqual(len(self.sent('mcp.t3_thread_send')), 2)
+
     def test_a_refused_dispatch_is_not_a_replay(self):
         self.thread['archivedAt'] = '2026-09-08T00:00:00.000Z'      # T3 refuses the send: thread_not_sendable
         self.cli('say', 'test-thread', 'x', '--expect-turn', 'old', '--dispatch-id', 'refused-key-01', success=False)
