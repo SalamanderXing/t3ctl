@@ -230,6 +230,18 @@ ra=0; rb=0; wait $pa || ra=$?; wait $pb || rb=$?
 assert_contains "$(cat "$TMP/a" "$TMP/b")" "has moved past turn $cur" "the losing sender is told why"
 ok "say --expect-turn refuses stale and concurrent duplicate sends"
 
+# A say replayed with its --dispatch-id after its run became visible keeps
+# the predecessor it was sent after: t3-events watches --after-turn it, and
+# reporting the replayed run itself there would never deliver the reply.
+cur=$("$T3CTL" last "$TID" --json | jq -r .turnId)
+first=$("$T3CTL" say "$TID" "round 3" --dispatch-id say-replay-1 --expect-turn "$cur")
+[ "$(jq -r .previousTurnId <<<"$first")" = "$cur" ] || fail "first say reports the turn it followed: $first"
+again=$("$T3CTL" say "$TID" "round 3" --dispatch-id say-replay-1 --expect-turn "$cur")
+[ "$(jq -r .messageId <<<"$again")" = "$(jq -r .messageId <<<"$first")" ] || fail "a replayed say returns the same message"
+[ "$(jq -r .previousTurnId <<<"$again")" = "$cur" ] || fail "a replayed say keeps its original predecessor: $again"
+[ "$(jq -r .previousTurnId <<<"$again")" != "$(jq -r .turnId <<<"$again")" ] || fail "a receipt never names its own run as its predecessor"
+ok "say --dispatch-id replay keeps the turn it was first sent after"
+
 # ---- 2c. last / text cap ----------------------------------------------------
 out=$("$T3CTL" last "$SEED_OTHER"); [ ${#out} -eq 3500 ] || fail "last prints the whole reply as plain text (got ${#out} chars)"
 out=$("$T3CTL" show "$SEED_OTHER"); assert_contains "$out" "$LONG\"" "piped show is not truncated"
