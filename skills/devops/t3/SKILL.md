@@ -51,10 +51,10 @@ reply use `t3ctl last`, not `show` plus a script.
    t3ctl refuses to override it. Don't stop and re-create a thread because its
    mode surprises you — the mode you got is the one that is wanted.
    Model: without `--model`, t3ctl copies the project's most recent
-   thread's model (whatever the user used last — it can be codex). Name it when it
-   matters: "use codex" → `--model codex`, "with opus" →
-   `--model claude-opus-5`, otherwise `--model claude-fable-5-1` is a safe
-   default for coding tasks.
+   thread's model (whatever the user used last — it can be codex), so always
+   pass `--model`. The default for every coding task is
+   `--model claude-opus-5-5`; only deviate when the user names another model
+   for that task ("use codex" → `--model codex`).
    `t3ctl models` lists what this server has actually run (a `--model` value
    is a model name or instanceId from that list; options like reasoning
    effort are inherited from its last use).

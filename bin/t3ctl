@@ -128,7 +128,7 @@ unlimited when piped; 0 = unlimited).
 an exact title / workspaceRoot basename. Modes: approval-required,
 auto-accept-edits, auto, full-access. --model takes a model name or
 instance id from `t3ctl models` (e.g. codex, claude-opus-5), or a literal
-instanceId:model pair (claudeAgent:claude-fable-5-1) on a fresh server;
+instanceId:model pair (claudeAgent:claude-opus-5-5) on a fresh server;
 without it the project default is used. Tag = T3CTL_TAG.
 EOF
   exit 0
@@ -948,7 +948,7 @@ cmd_project() {
     set-model)
       local project=${2:-} sel=${3:-}
       [ -n "$project" ] && [ -n "$sel" ] || die "usage: t3ctl project set-model <project> <instanceId>:<model>"
-      case $sel in *:*) ;; *) die "model must be instanceId:model (e.g. claudeAgent:claude-fable-5-1)";; esac
+      case $sel in *:*) ;; *) die "model must be instanceId:model (e.g. claudeAgent:claude-opus-5-5)";; esac
       resolve_project "$project"
       rpc projects.mutate "$(jq -cn --arg pid "$PID" --arg i "${sel%%:*}" --arg mo "${sel#*:}" --arg cid "$(uuid)" '
         {type:"project.update", commandId:$cid, projectId:$pid,
