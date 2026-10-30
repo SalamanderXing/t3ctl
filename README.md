@@ -8,17 +8,24 @@ versioned thing.
 
 ```
 bin/t3ctl                 the CLI (JSON/JSONL out): projects, models, list, new, say, last,
-                          show, search, watch, approvals, approve, approve-callbacks,
-                          settle/unsettle, interrupt/stop/rm, selftest
+                          show, search, watch, answer, approvals, approve, approve-callbacks,
+                          settle/unsettle, interrupt/stop/rm, selftest, contract-check
                           (`list` with no flag is the app's inbox — unsettled,
                           unarchived; `--unarchived` is every non-archived
                           thread, `--all` adds archived, `--active` only in-flight)
-bin/t3-token-renew        mints a 30 d bearer token as the t3 user, probes it, swaps
-                          it in root-only, revokes the predecessor; alerts on failure
+bin/t3-mcp                T3's orchestration MCP endpoint (POST /mcp; stdlib Python):
+                          the transport for everything MCP covers (since v0.6.0)
+bin/t3ctl-legacy.sh       the part of t3ctl still on T3's private API (sourced):
+                          approvals, the callback approver, stop, rm, list --all,
+                          say mode changes, project add/set-model
+bin/t3-token-renew        mints both 30 d credentials as the t3 user, probes each on
+                          its own path, swaps them in root-only, revokes the
+                          predecessors; alerts on failure
 bin/t3-notify             a session's callback to the agent: signed POST to the hermes
                           webhook platform (route t3-callback)
 bin/t3-rpc                one Effect-RPC call over t3's /ws WebSocket (stdlib Python);
-                          t3ctl sends every command through it
+                          the legacy path's commands go through it
+bin/t3-events             session state events for the Hermes gateway (opt-in)
 units/                    t3-token-renew.timer (weekly), t3-callback-approver.service
 skills/devops/t3/         the agent-facing Hermes skill
 install.sh                idempotent installer (run as root on the box)
@@ -34,7 +41,7 @@ git clone https://github.com/SalamanderXing/t3ctl /opt/t3ctl   # or unpack `git 
 git -C /opt/t3ctl checkout v0.1.0
 /opt/t3ctl/install.sh
 $EDITOR /etc/t3ctl.conf            # paths, tag, notify binary name, alert targets
-systemctl start t3-token-renew     # mints the first token
+systemctl start t3-token-renew     # mints both credentials
 ```
 
 Then wire the callback (once per box) and the skill:
@@ -67,7 +74,7 @@ and t3ctl runs as the same user and `T3CODE_HOME` as the t3 server. The box
 sets in `/etc/t3ctl.conf`:
 
 ```
-T3CTL_TOKEN_MODE=self          # t3ctl mints/rotates its own session (flock-serialised, retried once on 401)
+T3CTL_TOKEN_MODE=self          # t3ctl mints/rotates its own sessions (flock-serialised, retried once on 401)
 T3CODE_HOME=/data/t3
 T3CTL_TOKEN_FILE=/data/t3/t3ctl.token
 T3CTL_ALLOW_FULL_ACCESS=${T3CTL_ALLOW_FULL_ACCESS:-0}   # --full-access refused unless the box env opts in
@@ -84,13 +91,34 @@ and the entrypoint runs `t3ctl approve-callbacks --loop 15` itself instead of
 the systemd unit. Extra commands that exist for fresh servers: `project add
 <path>`, `project set-model <project> <instanceId:model>`, a literal
 `--model instanceId:model`, `token status|renew`, and `contract-check` (a
-read-only probe of every API/schema contract, for version bumps; `selftest`
-stays the end-to-end probe). `tests/smoke.sh` exercises all of this against
-`tests/fake_t3_server.py` without a real t3.
+read-only probe of every MCP tool and API/schema contract, for version bumps;
+`selftest` stays the end-to-end probe). In self mode the MCP credential is
+minted on first use too (next to `T3CTL_TOKEN_FILE`, as `….mcp`), with the
+ceiling `T3CTL_MCP_ACCESS` — `auto` while `T3CTL_ALLOW_FULL_ACCESS=0`.
+`tests/smoke.sh` exercises all of this against `tests/fake_t3_server.py`
+(and its fake `/mcp`, `tests/fake_t3_mcp.py`) without a real t3.
 
 ## Why the pieces exist
 
-- **Guardrails are in t3ctl, not the API.** `new` starts threads in
+- **Commands go over T3's MCP endpoint (v0.6.0).** The app's private
+  Effect-RPC broke dispatch after T3 bumps (HTTP 500 nine times since
+  2026-08-26); `/mcp` is the surface T3's own agents use. `new` launches an
+  idle thread and sends the prompt with `clientRequestId` = the receipt's
+  `dispatchId`, so a retried `new`/`say` (or `--dispatch-id`) returns the same
+  thread and message instead of new work. `watch` blocks server-side in
+  `t3_thread_wait` slices instead of polling. What MCP cannot do stays on the
+  private API in `bin/t3ctl-legacy.sh`; docs/COMPAT.md lists each such call.
+- **Two least-privilege credentials.** `/mcp` accepts only `mcp-client`
+  sessions and every other path rejects them. The MCP credential carries
+  `orchestration:read` + `orchestration:operate` and a runtime-mode ceiling
+  (`T3CTL_MCP_ACCESS`); T3 grants a ceiling only through its OAuth approval,
+  so it is minted with a one-time pairing code (a CLI-issued `mcp-client`
+  session with operate is capped at approval-required and cannot message a
+  full-access thread). At a full-access ceiling T3 attaches `settings:write`
+  and `source-control:write`, usable on `/mcp` only. The legacy credential is
+  an ordinary session with `T3CTL_TOKEN_SCOPES` (read + operate). Before
+  v0.6.0 the single token held every scope, `access:write` included.
+- **Guardrails are in t3ctl, not the API.** MCP enforces none of them. `new` starts threads in
   `T3CTL_DEFAULT_MODE` (approval-required unless the deployment says
   otherwise; a full-access default needs `T3CTL_ALLOW_FULL_ACCESS=1` and
   falls back to approval-required with a warning otherwise) with a title
@@ -98,30 +126,35 @@ stays the end-to-end probe). `tests/smoke.sh` exercises all of this against
   `new` refuses at `T3CTL_MAX_RUNNING` running tagged turns; `stop`/
   `interrupt`/`rm` refuse untagged threads without `--force`; `say` inherits
   the target thread's mode.
-- **Tokens always expire** (30 d, no `--scopes`), hence the weekly rotation
-  with a pre-swap probe and post-swap revoke.
+- **Tokens always expire** (30 d), hence the weekly rotation of both, each
+  with a pre-swap probe on its own path and a post-swap revoke.
 - **The callback needs the approver.** In approval-required mode the
   session's own `t3-notify` run is a command approval; without
   `t3-callback-approver` an unattended thread can never say "done". The
   approver accepts only that exact command, only in tagged threads.
-- **Commands go over the WebSocket.** t3 0.0.46 (orchestration V2) removed
-  the HTTP dispatch route; reads stay HTTP GETs but need the
+- **The legacy path goes over the WebSocket.** t3 0.0.46 (orchestration V2)
+  removed the HTTP dispatch route; reads stay HTTP GETs but need the
   `x-t3-orchestration-protocol: 2` header. `bin/t3-rpc` speaks just enough
   WebSocket + Effect-RPC for one request/response, so t3ctl needs no new
-  dependencies. t3ctl ≥ v0.3.0 needs t3 ≥ 0.0.46; older t3 needs v0.2.0.
-- **V2's read model is normalised to the old output.** Runs, runtime requests
-  and turn items are folded into the `latestTurn`/`approvals[].payload`/
-  `userInputs` shapes the skill already reads, so agents see no change. An
-  approval's `detail` is the exact command (from the `command_execution` item
-  with the same native tool id), never the model's description of it.
+  dependencies. t3ctl ≥ v0.6.0 needs t3 ≥ 0.1.0 (MCP orchestration);
+  v0.3.0–v0.5.0 need t3 ≥ 0.0.46; older t3 needs v0.2.0.
+- **MCP and V2 data are normalised to the old output.** Runs, pending
+  requests and timeline items are folded into the `latestTurn`/
+  `approvals[].payload`/`userInputs` shapes the skill already reads, so agents
+  see no change (`tests/shapes.py` diffs every command against v0.5.0's
+  recorded shapes). An approval's `detail` is the exact command (from the
+  `command_execution` item with the same native tool id), never the model's
+  description of it — MCP cannot correlate the two, so approvals stay on the
+  legacy path.
 
 ## Coupling to T3
 
-t3ctl speaks t3's *internal* orchestration API (and `t3-events` reads its
-SQLite). Both change without notice between nightlies. `docs/COMPAT.md` records the
-(t3ctl tag, t3 version) pairs that were verified; `docs/t3-hermes-control.md`
-§4 is the procedure for re-deriving the contracts from the source map when a
-bump breaks something.
+Since v0.6.0 t3ctl mostly speaks T3's MCP endpoint, whose tools T3's own
+agents use; what remains on t3's *internal* orchestration API (and
+`t3-events managed`'s SQLite read) can change without notice between
+nightlies. `docs/COMPAT.md` records the (t3ctl tag, t3 version) pairs that
+were verified and every remaining internal dependency; `t3ctl contract-check`
+probes all of them and names any missing MCP tool.
 
 ## Session state events
 
@@ -134,7 +167,15 @@ route that changed owners before acceptance.
 
 `new`/`say` capture HERMES_SESSION_ID and HERMES_SESSION_KEY in a persistent
 SQLite subscription; the receipt says `monitoring: events` only if registration
-succeeded. Interactive messaging gateways are supported. CLI, webhook and
+succeeded. Otherwise it says `monitoring: manual` with `monitoringReason`:
+`events-disabled` (`T3CTL_EVENTS_ENABLED` is not 1), `missing:<VAR>[,<VAR>]`
+(which of `HERMES_SESSION_ID`/`_KEY`/`_PLATFORM` was absent from t3ctl's
+environment), `platform:<platform>-not-in-origins` (a webhook/api_server lane
+not listed in `T3CTL_EVENTS_ORIGINS`), `registration-error` or
+`relay-not-installed`. Each decision, events or manual, is appended as one JSON
+line to `t3ctl-events.log` beside the events DB (`T3CTL_EVENTS_LOG`,
+size-capped): timestamp, threadId, dispatchId, platform, outcome, reason and the
+names — never values — of the `HERMES_SESSION_*` variables present. Interactive messaging gateways are supported. CLI, webhook and
 api_server origins keep manual monitoring; they must not be promised an async
 return path through a messaging adapter. The exception is a webhook/api_server
 lane whose sessions persist across turns and whose adapter accepts injected
@@ -142,8 +183,8 @@ turns: list its chat-id prefixes in `T3CTL_EVENTS_ORIGINS` (comma-separated,
 e.g. `webhook:linear-comment:thread-`). `t3-events eligible` is the single
 decision both `new`'s prompt footer and registration use.
 
-The relay observes typed T3 state every 15 seconds, with no model calls while
-nothing changes. Completion, errors and pending input/approval requests create
+The relay observes typed T3 state every 15 seconds (through `t3ctl watch
+--timeout 0`, i.e. MCP), with no model calls while nothing changes. Completion, errors and pending input/approval requests create
 a durable outbox event identified by dispatch + turn + state + request IDs.
 New dispatches supersede pending events from older turns. A busy parent leaves
 the event pending without consuming retry attempts. Closed or unrelated
@@ -165,16 +206,18 @@ question IDs. `watch --after-turn PREVIOUS` never presents the previous turn
 as the newly-dispatched turn. Its full JSON input goes through stdin, so large
 responses cannot overflow the OS argument limit.
 
-Run `python3 -m unittest discover -s tests -p 'test_*.py'` and `bash tests/smoke.sh`.
+Run `bash tests/smoke.sh` (it ends with the v0.5.0 output-shape comparison and
+the unit tests, `python3 -m unittest discover -s tests -p 'test_*.py'`).
 
 State-read failures back off and stop after eight consecutive failures, emitting
 `monitoring-failed` for the owner to inspect. `t3-events status` exposes retained
 event outcomes and subscription states. A new dispatch resets monitoring.
 
-Turn ownership is resolved from the dispatched message: every V2 run records
-the `userMessageId` that started it (`orchestration_v2_projection_runs` for
-`t3-events`, the thread snapshot's `runs` for `watch`), never from whichever
-turn happens to appear next. Receipts include the dispatched message ID; `watch --message-id ID` waits
+Turn ownership is resolved from the dispatched message: T3 records the run
+each user message started (the MCP user-message item for `watch` and the
+relay's poll; `orchestration_v2_projection_runs` for `t3-events managed`, which
+runs inside the coding session and holds no t3ctl credential), never from
+whichever turn happens to appear next. Receipts include the dispatched message ID; `watch --message-id ID` waits
 for that mapping or reports supersession without unrelated output. `contract-check`
 validates these source columns. Successful unmanaged dispatches release the old
 subscription, and callback suppression checks the actual current turn so desktop
