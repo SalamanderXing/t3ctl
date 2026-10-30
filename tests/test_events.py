@@ -135,6 +135,60 @@ class EventsTest(unittest.TestCase):
         with events.connect(self.db) as db:
             self.assertEqual(db.execute('SELECT disposition FROM events').fetchone()[0], 'superseded')
 
+    def owner(self):
+        with events.connect(self.db) as db:
+            row = db.execute("SELECT dispatch_id FROM subscriptions WHERE thread_id='thread'").fetchone()
+        return row[0] if row else None
+
+    def test_replay_never_displaces_a_newer_dispatch(self):
+        # Either order of a replayed A and a fresh B leaves B owning the thread
+        # and B's pending event untouched; t3ctl holds no lock across this.
+        replay = {**self.env, 'T3CTL_EVENTS_REPLAY': '1'}
+        newer = {**self.receipt, 'dispatchId': 'newer', 'messageId': 'm2', 'previousTurnId': 'turn', 'turnId': 'turn2'}
+        self.assertTrue(events.register(newer, self.env, self.db))
+        with events.connect(self.db) as db:
+            subscription = dict(db.execute('SELECT * FROM subscriptions').fetchone())
+        events.observe(subscription, {'turnId': 'turn2', 'reason': 'settled', 'turn': 'completed', 'lastAssistant': 'B done'}, self.db)
+        self.assertFalse(events.register(self.receipt, replay, self.db))   # replay of A after B registered
+        self.assertEqual(self.owner(), 'newer')
+        self.assertEqual([e['dispatch_id'] for e in events.pending(self.db)], ['newer'])
+        self.assertEqual(events.register_decision(self.receipt, replay, self.db, self.db.with_suffix('.log')),
+                         {'registered': False, 'reason': 'replay-superseded'})
+        # An ineligible replay deletes and supersedes nothing either.
+        self.assertFalse(events.register(self.receipt, {**replay, 'HERMES_SESSION_PLATFORM': 'webhook'}, self.db))
+        self.assertEqual(self.owner(), 'newer')
+        self.assertEqual(len(events.pending(self.db)), 1)
+        # The other order: A's replay lands first (refreshing its own row), then B takes over.
+        other = Path(self.db.parent) / 'other.sqlite'
+        self.assertTrue(events.register(self.receipt, self.env, other))
+        self.assertTrue(events.register(self.receipt, replay, other))
+        self.assertTrue(events.register(newer, self.env, other))
+        with events.connect(other) as db:
+            self.assertEqual(db.execute('SELECT dispatch_id FROM subscriptions').fetchone()[0], 'newer')
+
+    def test_concurrent_replay_and_newer_dispatch_always_leave_the_newer_owner(self):
+        import threading
+        replay = {**self.env, 'T3CTL_EVENTS_REPLAY': '1'}
+        for i in range(30):
+            path = Path(self.db.parent) / f'race-{i}.sqlite'
+            self.assertTrue(events.register(self.receipt, self.env, path))   # A owns the thread
+            newer = {**self.receipt, 'dispatchId': f'newer-{i}', 'messageId': f'm-{i}'}
+            barrier = threading.Barrier(2)
+            def run(receipt, env):
+                barrier.wait()
+                events.register(receipt, env, path)
+            workers = [threading.Thread(target=run, args=(self.receipt, replay)), threading.Thread(target=run, args=(newer, self.env))]
+            for w in workers: w.start()
+            for w in workers: w.join()
+            with events.connect(path) as db:
+                self.assertEqual(db.execute('SELECT dispatch_id FROM subscriptions').fetchone()[0], f'newer-{i}')
+
+    def test_replay_recovers_a_missing_registration(self):
+        with events.connect(self.db) as db:
+            db.execute('DELETE FROM subscriptions')
+        self.assertTrue(events.register(self.receipt, {**self.env, 'T3CTL_EVENTS_REPLAY': '1'}, self.db))
+        self.assertEqual(self.owner(), 'dispatch')
+
     def test_webhook_cannot_register_callback_loop(self):
         self.assertFalse(events.register(self.receipt, {**self.env, 'HERMES_SESSION_PLATFORM': 'webhook'}, self.db))
 

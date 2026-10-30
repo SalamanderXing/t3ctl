@@ -383,7 +383,7 @@ check_ceiling() { # $1 mode a thread will run in → refuse before anything is c
 LEDGER=${T3CTL_DISPATCH_LEDGER:-$MCP_TOKEN_FILE.dispatches}
 fingerprint() { printf '%s' "$1" | sha256sum | cut -c1-16; }
 
-ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerprint → new|retry|attempted|replay
+ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerprint, [$5 previous turn] → new|retry|attempted|replay
   local out
   out=$( umask 077
     exec 7>>"$LEDGER.lock" 2>/dev/null || { echo "error:cannot open $LEDGER.lock"; exit 0; }
@@ -401,8 +401,8 @@ ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerpri
       exit 0
     fi
     { [ ! -s "$LEDGER" ] || jq -c --arg cut "$(date -u -d '-35 days' +%Y-%m-%dT%H:%M:%SZ)" 'select(.at >= $cut)' "$LEDGER"
-      jq -cn --arg k "$1" --arg t "$2" --arg d "$3" --arg c "$4" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{dispatchId:$d, kind:$k, target:$t, credential:$c, state:"reserved", at:$at}'
+      jq -cn --arg k "$1" --arg t "$2" --arg d "$3" --arg c "$4" --arg p "${5:-}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{dispatchId:$d, kind:$k, target:$t, credential:$c, state:"reserved", at:$at} + (if $p == "" then {} else {previousTurnId:$p} end)'
     } > "$LEDGER.tmp" 2>/dev/null && mv "$LEDGER.tmp" "$LEDGER" 2>/dev/null || { echo "error:cannot write $LEDGER"; exit 0; }
     echo new
   )
@@ -415,21 +415,30 @@ ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerpri
   esac
 }
 
-ledger_mark() { # $1 dispatch id, $2 attempted|accepted (failures only warn: the entry stays protective)
+ledger_mark() { # $1 dispatch id, $2 attempted|accepted, [$3 previous turn at this send] (failures only warn: the entry stays protective)
   ( umask 077
     exec 7>>"$LEDGER.lock" && flock -w 30 7 || exit 1
-    jq -c --arg d "$1" --arg st "$2" 'if .dispatchId == $d then .state = $st else . end' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+    jq -c --arg d "$1" --arg st "$2" --arg p "${3:-}" \
+      'if .dispatchId == $d then .state = $st | (if $p == "" then . else .previousTurnId = $p end) else . end' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
   ) 2>/dev/null || echo "t3ctl: warning: could not mark dispatch $1 $2 in $LEDGER" >&2
 }
 ledger_accept() { ledger_mark "$1" accepted; }
+# The thread's latest turn when this dispatch was first reserved. A replay
+# reads the thread after its own run became visible, so its receipt must not
+# report that run as the predecessor: t3-events would then wait for a turn
+# after it (watch --after-turn) and never deliver the reply.
+ledger_previous() { # $1 dispatch id → previousTurnId recorded at reservation, or nothing
+  [ -e "$LEDGER" ] || return 0
+  jq -r --arg d "$1" 'select(.dispatchId == $d) | .previousTurnId // empty' "$LEDGER" 2>/dev/null | tail -1
+}
 
-begin_dispatch() { # $1 kind, $2 target, $3 dispatch id → REPLAY=1 for an accepted same-credential replay,
+begin_dispatch() { # $1 kind, $2 target, $3 dispatch id, [$4 previous turn] → REPLAY=1 for an accepted same-credential replay,
   #                  ATTEMPTED=1 when an earlier send of this id may have been accepted (outcome unknown)
   # Pins the credential the ledger was checked against for every MCP call of
   # this dispatch: no re-mint or retry under another credential mid-dispatch.
   local tok state
   tok=$(mcp_token) || exit 1
-  state=$(ledger_reserve "$1" "$2" "$3" "$(fingerprint "$tok")") || exit 1
+  state=$(ledger_reserve "$1" "$2" "$3" "$(fingerprint "$tok")" "${4:-}") || exit 1
   MCP_PINNED=$tok
   REPLAY=""; [ "$state" != replay ] || REPLAY=1
   ATTEMPTED=""; [ "$state" != attempted ] || ATTEMPTED=1
@@ -566,6 +575,7 @@ EVENTS_DB=${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}
 EVENTS_LOG=${T3CTL_EVENTS_LOG:-$(dirname "$EVENTS_DB")/t3ctl-events.log}
 t3_events() {
   T3CTL_EVENTS_ENABLED="${T3CTL_EVENTS_ENABLED:-0}" T3CTL_EVENTS_ORIGINS="${T3CTL_EVENTS_ORIGINS:-}" T3CODE_HOME="$T3_HOME" \
+    T3CTL_EVENTS_REPLAY="${T3CTL_EVENTS_REPLAY:-}" \
     T3CTL_EVENTS_DB="$EVENTS_DB" T3CTL_EVENTS_LOG="$EVENTS_LOG" "$HERE/t3-events" "$@"
 }
 
@@ -577,6 +587,15 @@ events_log_fallback() { # $1 receipt, $2 reason — when t3-events itself could 
       --arg platform "${HERMES_SESSION_PLATFORM:-}" --argjson present "$present" \
       '{ts:$ts, threadId:$r.threadId, dispatchId:$r.dispatchId, platform:(if $platform == "" then null else $platform end),
         monitoring:"manual", reason:$reason, present:$present}' >> "$EVENTS_LOG"; } 2>/dev/null || true
+}
+
+register_dispatch() { # stdin receipt → register_events; a replay or re-try registers as one (T3CTL_EVENTS_REPLAY)
+  # A replayed or re-tried --dispatch-id may recover a lost registration but
+  # must never take over a newer dispatch's subscription: t3-events decides
+  # that atomically (see register() there) and reports replay-superseded.
+  local T3CTL_EVENTS_REPLAY=""
+  [ -z "$REPLAY$ATTEMPTED" ] || T3CTL_EVENTS_REPLAY=1
+  register_events
 }
 
 register_events() {
@@ -706,7 +725,7 @@ Run it as a plain command exactly in that form (double-quoted summary, no other 
          --arg dispatch_id "$dispatch_id" --argjson msel "$msel" \
     '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state,
       turnId:(if $state == "not-visible" then null else $sent.runId end), previousTurnId:"none",
-      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_events
+      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch
 }
 
 cmd_say() {
@@ -753,7 +772,11 @@ cmd_say() {
   [ -z "$msel" ] || cur_sel=$(thread_selection "$TID") || exit 1   # read before anything changes
   local old; old=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
   [ -n "$dispatch_id" ] || dispatch_id=$(uuid)
-  begin_dispatch say "$TID" "$dispatch_id"
+  begin_dispatch say "$TID" "$dispatch_id" "$old"
+  if [ -n "$REPLAY$ATTEMPTED" ]; then
+    local first_old; first_old=$(ledger_previous "$dispatch_id")
+    [ -z "$first_old" ] || old=$first_old
+  fi
   # An accepted same-credential replay returns that message; its own send is
   # what moved the thread past --expect-turn.
   if [ -n "$expect_turn" ] && [ -z "$REPLAY" ]; then
@@ -802,7 +825,7 @@ cmd_say() {
   # uncertain, and the ledger marks the id attempted so a retry changes nothing.
   # States only move forward for an entry that was already attempted or
   # accepted: a later refusal of its replay says nothing about the first send.
-  [ -n "$REPLAY$ATTEMPTED" ] || ledger_mark "$dispatch_id" attempted
+  [ -n "$REPLAY$ATTEMPTED" ] || ledger_mark "$dispatch_id" attempted "$old"   # this send's predecessor: a refused earlier one may have reserved an older turn
   if ! mcp_raw call t3_thread_send - --retry < <(printf '%s' "$text" | jq -Rsc --arg tid "$TID" --arg rid "$dispatch_id" \
         '{threadId:$tid, message:., mode:"queue", clientRequestId:$rid}'); then
     if [ "$MCP_RC" = 2 ] && [[ $(jq -r '.code // ""' <<<"$MCP_ERR" 2>/dev/null) =~ ^(runtime_mode_escalation_denied|interaction_mode_escalation_denied|capability_denied|thread_not_found|thread_not_sendable|invalid_request|parent_not_active)$ ]]; then
@@ -820,7 +843,8 @@ cmd_say() {
   exec 8>&-   # new run visible (or given up on): next sender may check
   jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --argjson sent "$sent" --arg old "$old" --arg dispatch_id "$dispatch_id" \
     '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $sent.runId end),
-      previousTurnId:$old, dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_events
+      previousTurnId:(if $old == $sent.runId then "none" else $old end),   # a ledger entry from before v0.6.1 has no predecessor
+      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch
 }
 
 cmd_answer() {

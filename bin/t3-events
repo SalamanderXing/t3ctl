@@ -126,6 +126,8 @@ def register_decision(receipt, env=None, path=None, log=None):
     eligible_now, reason = decide(env)
     try:
         ok = register(receipt, env, path)
+        if eligible_now and not ok:   # only a replay is refused by an eligible session
+            reason = 'replay-superseded'
     except (sqlite3.Error, OSError, KeyError) as exc:
         logger.warning('event registration failed: %s', exc)
         ok = False
@@ -136,8 +138,34 @@ def register_decision(receipt, env=None, path=None, log=None):
 
 
 def register(receipt, env=None, path=None):
+    """Subscribe the calling session to the thread's T3 state for this dispatch.
+
+    A fresh dispatch takes the thread over: the latest send owns its events.
+    A replay (T3CTL_EVENTS_REPLAY=1: a --dispatch-id re-sent after T3 may
+    already have accepted it) can only recover a missing registration or
+    refresh its own. It never displaces another dispatch's subscription,
+    deletes one, or supersedes pending events, so a replay of an older
+    dispatch racing a newer send cannot drop the newer one's result. The
+    conditional upsert is one SQLite statement, so no lock is needed.
+    """
     env = os.environ if env is None else env
     sid, key = env.get('HERMES_SESSION_ID'), env.get('HERMES_SESSION_KEY')
+    if env.get('T3CTL_EVENTS_REPLAY') == '1':
+        if not eligible(env):
+            return False
+        with connect(path) as db:
+            db.execute('''INSERT INTO subscriptions
+                (thread_id, dispatch_id, parent_session_id, session_key, previous_turn, message_id, turn_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                parent_session_id=excluded.parent_session_id, session_key=excluded.session_key,
+                previous_turn=excluded.previous_turn, message_id=excluded.message_id, turn_id=excluded.turn_id,
+                created_at=excluded.created_at, last_status='running', poll_failures=0, next_poll=0
+                WHERE subscriptions.dispatch_id = excluded.dispatch_id''',
+                (receipt['threadId'], receipt['dispatchId'], sid, key,
+                 receipt['previousTurnId'], receipt['messageId'], None, time.time()))
+            owner = db.execute('SELECT dispatch_id FROM subscriptions WHERE thread_id=?', (receipt['threadId'],)).fetchone()
+        return bool(owner) and owner[0] == receipt['dispatchId']
     if not eligible(env):
         # Successful manual dispatch transfers ownership away from the gateway.
         if Path(path or database_path()).exists():
