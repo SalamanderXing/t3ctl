@@ -391,6 +391,50 @@ class TransportTest(unittest.TestCase):
         self.thread['requests'] = [{'id': 'r1', 'kind': 'command', 'status': 'pending', 'runId': 'old', 'command': 'ls'}]
         self.assertEqual(self.cli('show', tid)['approvals'][0]['payload']['detail'], 'ls')
 
+    def test_refused_message_restores_the_modes_it_changed(self):
+        # configured ceiling full-access, but this credential was minted at approval-required
+        (self.path / 'mcp-tokens').write_text('test-mcp-token approval-required\n')
+        out = self.cli('say', 'test-thread', 'Go', '--full-access', '--execute', success=False)
+        self.assertIn('runtime_mode_escalation_denied', out.stderr)
+        self.assertEqual((self.thread['runtimeMode'], self.thread['interactionMode']), ('approval-required', 'plan'))
+        self.assertEqual(self.sent('mcp.t3_thread_send'), [])
+
+    def test_ceiling_is_checked_before_anything_changes(self):
+        self.env['T3CTL_MCP_ACCESS'] = 'auto'
+        out = self.cli('say', 'test-thread', 'Go', '--full-access', success=False)
+        self.assertIn('capped at auto (T3CTL_MCP_ACCESS)', out.stderr)
+        self.assertEqual(self.server.state.dispatched, [])
+        out = self.cli('new', 'project', 'x', '--full-access', '--model', 'codex:test', success=False)
+        self.assertIn('capped at auto', out.stderr)
+        self.assertEqual(self.server.state.dispatched, [])
+
+    def test_question_response_mode_survives(self):
+        self.thread['requests'] = [{**self.request(), 'responseMode': 'message'}]
+        self.assertEqual(self.cli('watch', 'test-thread', '--timeout', '0')['userInputs'][0]['responseMode'], 'message')
+        self.assertEqual(self.cli('show', 'test-thread')['userInputs'][0]['responseMode'], 'message')
+
+    def test_dispatch_replay_across_a_rotated_credential_is_refused(self):
+        first = self.cli('say', 'test-thread', 'hello', '--expect-turn', 'old', '--dispatch-id', 'replay-key-0001')
+        # same credential: the lost-receipt retry returns the same message even though the turn moved
+        again = self.cli('say', 'test-thread', 'hello', '--expect-turn', 'old', '--dispatch-id', 'replay-key-0001')
+        self.assertEqual(first['messageId'], again['messageId'])
+        self.assertEqual(len(self.sent('mcp.t3_thread_send')), 1)
+        (self.path / 'mcp-tokens').write_text('test-mcp-token full-access\nrotated-token full-access\n')
+        (self.path / 'token.mcp').write_text('rotated-token')
+        out = self.cli('say', 'test-thread', 'hello', '--dispatch-id', 'replay-key-0001', success=False)
+        self.assertIn('credential that has since been rotated', out.stderr)
+        self.assertEqual(len(self.sent('mcp.t3_thread_send')), 1)
+        ledger = (self.path / 'token.mcp.dispatches').read_text()
+        self.assertNotIn('test-mcp-token', ledger)
+        self.assertEqual(oct((self.path / 'token.mcp.dispatches').stat().st_mode & 0o777), '0o600')
+        out = self.cli('say', 'other-thread', 'x', '--dispatch-id', 'replay-key-0001', success=False)
+
+    def test_finite_cap_above_one_item_still_marks_truncation(self):
+        self.thread['messages'] = [{'role': 'assistant', 'text': 'y' * 90000, 'runId': 'old'}]
+        self.env['T3CTL_TEXT_CAP'] = '80000'
+        text = self.cli('watch', 'test-thread', '--timeout', '0')['lastAssistant']
+        self.assertEqual(text, 'y' * 80000 + '…[truncated]')
+
     def test_prefix_resolution_and_say_idempotency(self):
         out = self.cli('say', 'test-th', 'hello', '--dispatch-id', 'retry-key-0001')
         again = self.cli('say', 'test-thread', 'hello', '--dispatch-id', 'retry-key-0001')

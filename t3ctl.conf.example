@@ -33,6 +33,9 @@ T3CTL_TOKEN_LABEL=t3ctl
 #                               # Minted with a one-time pairing code (OAuth approval):
 #                               # a CLI-issued mcp-client session is capped at
 #                               # approval-required. TTL is T3's fixed 30 d.
+#T3CTL_DISPATCH_LEDGER=/etc/t3ctl/token.mcp.dispatches   # default: $T3CTL_MCP_TOKEN_FILE.dispatches;
+#                               # dispatch id → credential fingerprint, so a --dispatch-id
+#                               # replay after a rotation is refused instead of duplicated
 #T3CTL_WATCH_SLICE=15           # watch blocks server-side in slices of this many seconds,
 #                               # re-checking for pending approvals/questions between them
 

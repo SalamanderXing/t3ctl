@@ -99,7 +99,8 @@ sid=$(jq -r '.sessionId // empty' <<<"$out" 2>/dev/null)
 # Probe the new token before swapping it in — never replace a working token
 # with a broken one. (/api/orchestration/snapshot is gone in V2 and its path
 # falls through to the web app with a 200, so it proved nothing.)
-curl -sSf -m 30 -H "Authorization: Bearer $tok" -H "x-t3-orchestration-protocol: 2" \
+# (the header comes from a file descriptor: a token in argv is readable by every local user)
+curl -sSf -m 30 -H @<(printf 'Authorization: Bearer %s\n' "$tok") -H "x-t3-orchestration-protocol: 2" \
   "$BASE/api/orchestration/shell" -o /dev/null \
   || fail "new legacy token failed its shell probe (t3 down, or API changed after a T3_VERSION bump)"
 install_token "$tok" "$sid" "$TOKEN_FILE" "$SESSION_FILE" legacy

@@ -42,6 +42,18 @@ Behaviour changes callers may notice (not t3-version related):
     text; `matchedIn` is still `title`, `user` or `assistant`); a `--limit`
     above 50 is capped at 50.
   - `models` counts only unarchived threads (MCP lists no archived ones).
+  - `show -n N` reads at most the last 50 turns (`t3_thread_read`'s
+    `runLimit` maximum); `-n 0` means those 50. v0.5.0 read a bounded
+    snapshot, so `-n 0` was never the full history either.
+  - a `--dispatch-id` replay under a rotated MCP credential is refused (T3
+    de-duplicates only within one credential); t3ctl keeps a ledger of
+    dispatch id → kind, target, credential fingerprint in
+    `T3CTL_DISPATCH_LEDGER` (default `$T3CTL_MCP_TOKEN_FILE.dispatches`,
+    0600, 35 days). A same-credential replay returns the original message
+    and skips `--expect-turn`/the running cap, which that dispatch already passed.
+  - `say` checks the target mode against `T3CTL_MCP_ACCESS` before changing
+    anything, and if T3 still refuses the message (a credential minted at a
+    lower ceiling) it restores the modes/model it had changed.
   - `watch` waits server-side (`t3_thread_wait`) in slices of
     `T3CTL_WATCH_SLICE` (15 s); a pending approval or question is noticed at
     the next slice, at most 15 s late. The relay's `--timeout 0` checks are
@@ -92,7 +104,7 @@ MCP cannot do it:
 | call | used by | why not MCP |
 |---|---|---|
 | `GET /api/orchestration/shell` | `list --all`, `approve-callbacks`, `project add` (existing check) | `t3_thread_list` has no archived threads; the approver reads only this path |
-| `GET /api/orchestration/threads/<id>/bounded` | `approvals`, `approvals` in `show`/`watch`, `approve-callbacks`, `stop` | MCP cannot tie an approval to its exact command (`nativeItemRef`); provider sessions |
+| `GET /api/orchestration/threads/<id>/bounded` | `approvals`, `approvals` and `userInputs` in `show`/`watch`, `approve-callbacks`, `stop` | MCP cannot tie an approval to its exact command (`nativeItemRef`); MCP's questions lack `responseMode`; provider sessions |
 | RPC `orchestration.dispatchCommand` `runtime-request.respond` | `approve`, `approve-callbacks` | `t3_pending_request` cannot answer approvals |
 | RPC `thread.delete` | `rm`, `selftest` cleanup | no delete tool |
 | RPC `run.interrupt` + `provider-session.detach` | `stop` | MCP's stop leaves provider sessions attached |

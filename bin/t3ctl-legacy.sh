@@ -11,7 +11,8 @@
 #                                                     threads), the callback approver
 #   GET  /api/orchestration/threads/<id>/bounded      approvals: the exact command of an
 #                                                     approval (MCP has no item correlation),
-#                                                     stop: the live provider sessions
+#                                                     pending userInputs (MCP drops their
+#                                                     responseMode), stop: provider sessions
 #   RPC  orchestration.dispatchCommand (/ws)          runtime-request.respond (approve; MCP
 #                                                     cannot answer approvals), thread.delete
 #                                                     (rm), run.interrupt + provider-session.detach
@@ -26,6 +27,9 @@
 # working with only this token, and it needs nothing MCP would add.
 
 PROTO_HDR="x-t3-orchestration-protocol: 2"   # V2 read routes answer a bare 400 without it
+# curl reads the Authorization header from a file descriptor (-H @file), so
+# the token never appears in argv, which every local user can read in /proc.
+auth_hdr() { printf 'Authorization: Bearer %s\n' "$1"; }
 T3RPC=$(dirname "${BASH_SOURCE[0]}")/t3-rpc
 
 token() {
@@ -39,9 +43,9 @@ token() {
 api() { # api METHOD PATH [JSON_BODY]
   local method=$1 path=$2 body=${3:-} out code resp tok
   tok=$(token) || exit 1
-  local args=(-sS -m 60 -X "$method" -H "Authorization: Bearer $tok" -H "$PROTO_HDR" -w $'\n%{http_code}')
+  local args=(-sS -m 60 -X "$method" -H "$PROTO_HDR" -w $'\n%{http_code}')
   [ -n "$body" ] && args+=(-H "Content-Type: application/json" --data-binary @-)
-  out=$(printf '%s' "$body" | curl "${args[@]}" "$BASE$path") || die "cannot reach t3 at $BASE — is the t3 server up? (a full disk presents exactly like this: check df -h)"
+  out=$(printf '%s' "$body" | curl "${args[@]}" -H @<(auth_hdr "$tok") "$BASE$path") || die "cannot reach t3 at $BASE — is the t3 server up? (a full disk presents exactly like this: check df -h)"
   code=${out##*$'\n'}
   resp=${out%$'\n'*}
   if { [ "$code" = 401 ] || [ "$code" = 403 ]; } && [ "$TOKEN_MODE" = self ] && [ "${_T3CTL_RETRIED:-0}" = 0 ]; then
@@ -126,6 +130,9 @@ DETAIL_NORM=$TURN_STATE'
                      requestType: (if .requestKind == "command" then "command_execution_approval" else .requestKind end),
                      detail: (if .nativeItemRef.nativeId == null then null else $cmds[.nativeItemRef.nativeId] end),
                      decision: ($q.decision // null)}}],
+      userInputs: [$p.turnItems[] | select(.type == "user_input_request")
+        | select(($rr[.requestId].status // "") == "pending")
+        | {requestId, questions} + (if .responseMode then {responseMode} else {} end)],
       providerSessions: [$p.providerSessions[] | {id, status}]})}'
 uri() { jq -rn --arg s "$1" '$s | @uri'; }   # thread ids can hold %, : and / (delegated-task threads)
 legacy_thread_detail() { # $1 thread id

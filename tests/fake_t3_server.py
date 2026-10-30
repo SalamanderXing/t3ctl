@@ -137,7 +137,8 @@ class State:
                                      **({"decision": r["decision"]} if r.get("decision") else {})})
             if r["kind"] == "user_input":
                 items.append({"type": "user_input_request", "requestId": r["id"], "runId": r.get("runId"),
-                              "questions": r.get("questions", []), "nativeItemRef": None})
+                              "questions": r.get("questions", []), "nativeItemRef": None,
+                              **({"responseMode": r["responseMode"]} if r.get("responseMode") else {})})
                 continue
             items.append({"type": "command_execution", "runId": r.get("runId"), "input": r["command"],
                           "nativeItemRef": {"driver": "fake", "nativeId": tool, "strength": "strong"}})

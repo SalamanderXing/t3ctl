@@ -18,7 +18,6 @@ printed (latestTurn, session, hasPendingApprovals, …).
   t3-mcp messages ID [--runs N] [--cap C] [--with-error]
                                              thread + recent runs + their messages, full text
   t3-mcp run-of-message ID MESSAGE_ID        {"runId": …} the run a dispatched message started
-  t3-mcp user-inputs ID                      pending questions [{requestId, questions}]
   t3-mcp search QUERY [--limit N]            t3_thread_search + each match's updatedAt
   t3-mcp scopes ACCESS                       the scopes an MCP sign-in at ACCESS carries
   t3-mcp required-tools                      the tools t3ctl calls (comma-separated)
@@ -325,10 +324,11 @@ def scan(mcp, tid, item_count, view, enough, cap=0, window=200):
         window *= 4
 
 
-def complete_text(mcp, tid, item):
-    """Follow textOffset continuations so an agent gets the whole reply."""
+def complete_text(mcp, tid, item, cap=0):
+    """Follow textOffset continuations so an agent gets the whole reply, or
+    (cap > 0) at least cap + 1 characters, so the caller can mark truncation."""
     text = item.get("text") or ""
-    while item.get("textTruncated") and item.get("nextTextOffset") is not None:
+    while item.get("textTruncated") and item.get("nextTextOffset") is not None and (not cap or len(text) <= cap):
         item = mcp.call("t3_thread_read", {"threadId": tid, "itemId": item["itemId"],
                                            "textOffset": item["nextTextOffset"], "maxCharsPerItem": MAX_CHARS})
         item = (item.get("items") or [{}])[0]
@@ -354,7 +354,7 @@ def messages(mcp, tid, runs=4, cap=0, with_error=False):
     # Threads imported from V1 have no runs and their messages no runId; like
     # v0.5.0 (which read a bounded recent window) they show the tail window.
     items = scan(mcp, tid, thread["itemCount"], "messages", enough if wanted else (lambda items: True),
-                 cap=(cap + 1) if cap else 0, window=200 if wanted else RUNLESS_WINDOW)
+                 cap=min(cap + 1, MAX_CHARS) if cap else 0, window=200 if wanted else RUNLESS_WINDOW)
     out = []
     for i in items:
         if i.get("type") not in ("user_message", "assistant_message"):
@@ -363,7 +363,7 @@ def messages(mcp, tid, runs=4, cap=0, with_error=False):
             continue
         if i.get("runId") is None and i.get("position", 0) < oldest_runless:
             continue
-        text = complete_text(mcp, tid, i) if not cap else (i.get("text") or "")
+        text = complete_text(mcp, tid, i, cap)
         out.append({"id": i.get("messageId") or i.get("itemId"),
                     "role": "user" if i["type"] == "user_message" else "assistant",
                     "text": text, "createdAt": i.get("updatedAt"), "runId": i.get("runId")})
@@ -419,18 +419,6 @@ def scopes(access):
     if access == "full-access":
         return ["orchestration:read", "orchestration:operate", "settings:write", "source-control:write"]
     return ["orchestration:read", "orchestration:operate"]
-
-
-def user_inputs(mcp, tid):
-    ids = mcp.call("t3_pending_request", {"action": "list", "threadId": tid}).get("requestIds", [])
-    out = []
-    for rid in ids:
-        try:
-            q = mcp.call("t3_pending_request", {"action": "read", "threadId": tid, "requestId": rid})
-        except ToolFailure:
-            continue   # answered between list and read
-        out.append({"requestId": rid, "questions": q.get("questions", [])})
-    return out
 
 
 def attention(mcp, opts):
@@ -664,8 +652,6 @@ def main(argv):
             out = search(mcp, rest[0], int(f.get("limit", 20)))
         elif cmd == "run-of-message":
             out = run_of_message(mcp, argv[0], argv[1])
-        elif cmd == "user-inputs":
-            out = user_inputs(mcp, argv[0])
         else:
             return _usage(f"unknown command {cmd}")
         print(json.dumps(out, ensure_ascii=False))
