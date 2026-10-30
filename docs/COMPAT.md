@@ -31,10 +31,13 @@ Behaviour changes callers may notice (not t3-version related):
   reported the run itself, so `t3-events` watched for a turn after it and
   never delivered the reply. A ledger entry written by v0.6.0 has no
   recorded predecessor; its replay reports `none` (the message id still
-  identifies the run). A replay (or re-try) whose run the thread has since
-  moved past returns its receipt without re-registering events
-  (`monitoring: manual`, `monitoringReason: replay-superseded`): registering
-  it would take over the newer dispatch's subscription and drop its result.
+  identifies the run). A replay (or re-try) of a `--dispatch-id` registers
+  events only to recover a missing subscription or refresh its own: if
+  another dispatch owns the thread's subscription it is left alone, and the
+  receipt says `monitoring: manual`, `monitoringReason: replay-superseded`.
+  t3-events decides that in one conditional SQLite upsert, so a replay
+  racing a newer send cannot drop the newer one's result; a replay never
+  deletes a subscription or supersedes pending events.
 - v0.6.0: transport and credentials, not output. Every command keeps its
   flags and its JSON/JSONL field names and types (`tests/shapes.py` against
   v0.5.0's recorded shapes); additions only:

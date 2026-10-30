@@ -575,6 +575,7 @@ EVENTS_DB=${T3CTL_EVENTS_DB:-$T3_HOME/t3ctl-events.sqlite}
 EVENTS_LOG=${T3CTL_EVENTS_LOG:-$(dirname "$EVENTS_DB")/t3ctl-events.log}
 t3_events() {
   T3CTL_EVENTS_ENABLED="${T3CTL_EVENTS_ENABLED:-0}" T3CTL_EVENTS_ORIGINS="${T3CTL_EVENTS_ORIGINS:-}" T3CODE_HOME="$T3_HOME" \
+    T3CTL_EVENTS_REPLAY="${T3CTL_EVENTS_REPLAY:-}" \
     T3CTL_EVENTS_DB="$EVENTS_DB" T3CTL_EVENTS_LOG="$EVENTS_LOG" "$HERE/t3-events" "$@"
 }
 
@@ -588,24 +589,13 @@ events_log_fallback() { # $1 receipt, $2 reason — when t3-events itself could 
         monitoring:"manual", reason:$reason, present:$present}' >> "$EVENTS_LOG"; } 2>/dev/null || true
 }
 
-register_dispatch() { # stdin receipt, $1 thread id → register_events, unless this is a replay whose run the thread has moved past
-  # A replayed or re-tried --dispatch-id re-registers its receipt so a lost
-  # registration can be recovered. Once a newer dispatch has started a later
-  # turn, registering the old receipt would replace that dispatch's
-  # subscription and supersede its pending events: its result would never
-  # reach the conversation. Such a replay only returns its receipt.
-  local receipt turn latest=""
-  receipt=$(cat)
-  turn=$(jq -r '.turnId // empty' <<<"$receipt")
-  if [ -n "$REPLAY$ATTEMPTED" ] && [ -n "$turn" ] && mcp_raw thread "$1"; then
-    latest=$(jq -r '.latestTurn.turnId // "none"' <<<"$MCP_OUT")
-    if [ "$latest" != "$turn" ]; then
-      events_log_fallback "$receipt" replay-superseded
-      jq -c '. + {monitoring:"manual", monitoringReason:"replay-superseded"}' <<<"$receipt"
-      return
-    fi
-  fi
-  printf '%s' "$receipt" | register_events
+register_dispatch() { # stdin receipt → register_events; a replay or re-try registers as one (T3CTL_EVENTS_REPLAY)
+  # A replayed or re-tried --dispatch-id may recover a lost registration but
+  # must never take over a newer dispatch's subscription: t3-events decides
+  # that atomically (see register() there) and reports replay-superseded.
+  local T3CTL_EVENTS_REPLAY=""
+  [ -z "$REPLAY$ATTEMPTED" ] || T3CTL_EVENTS_REPLAY=1
+  register_events
 }
 
 register_events() {
@@ -735,7 +725,7 @@ Run it as a plain command exactly in that form (double-quoted summary, no other 
          --arg dispatch_id "$dispatch_id" --argjson msel "$msel" \
     '{threadId:$id, title:$title, mode:$mode, model:$msel.model, turn:$state,
       turnId:(if $state == "not-visible" then null else $sent.runId end), previousTurnId:"none",
-      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch "$tid"
+      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch
 }
 
 cmd_say() {
@@ -854,7 +844,7 @@ cmd_say() {
   jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --argjson sent "$sent" --arg old "$old" --arg dispatch_id "$dispatch_id" \
     '{threadId:$id, mode:$mode, turn:$state, turnId:(if $state == "not-visible" then null else $sent.runId end),
       previousTurnId:(if $old == $sent.runId then "none" else $old end),   # a ledger entry from before v0.6.1 has no predecessor
-      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch "$TID"
+      dispatchId:$dispatch_id, messageId:$sent.messageId}' | register_dispatch
 }
 
 cmd_answer() {
