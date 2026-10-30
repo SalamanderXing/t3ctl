@@ -429,6 +429,50 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(oct((self.path / 'token.mcp.dispatches').stat().st_mode & 0o777), '0o600')
         out = self.cli('say', 'other-thread', 'x', '--dispatch-id', 'replay-key-0001', success=False)
 
+    def test_mid_dispatch_revocation_never_resends_under_a_new_credential(self):
+        # self mode would normally re-mint on a 401 and retry; mid-dispatch it must not
+        auth = self.path / 'auth'
+        auth.mkdir()
+        self.server.auth_dir = auth
+        self.server.tokens_file.write_text('test-token\n')
+        self.env.update({'T3CTL_TOKEN_MODE': 'self', 'T3CTL_T3_BIN': str(ROOT / 'tests/fake_t3_cli.py'),
+                         'FAKE_T3_TOKENS': str(self.server.tokens_file), 'FAKE_T3_MCP_TOKENS': str(self.path / 'mcp-tokens'),
+                         'FAKE_T3_AUTH_DIR': str(auth), 'T3CTL_SESSION_FILE': str(self.path / 'session')})
+        self.server.mcp_revoke_after = 't3_thread_send'
+        out = self.cli('say', 'test-thread', 'once', '--dispatch-id', 'pinned-key-0001', success=False)
+        self.assertIn('may be partly sent', out.stderr)
+        self.assertEqual(len(self.sent('mcp.t3_thread_send')), 1)
+        self.assertFalse((auth / 'calls').exists() and 'pairing' in (auth / 'calls').read_text())   # no re-mint mid-dispatch
+        # the next command re-mints as usual, and a replay of the dispatch under that credential is refused
+        out = self.cli('say', 'test-thread', 'once', '--dispatch-id', 'pinned-key-0001', success=False)
+        self.assertIn('since been rotated', out.stderr)
+        self.assertEqual(len(self.sent('mcp.t3_thread_send')), 1)
+
+    def test_model_and_mode_changes_are_rolled_back_when_the_send_is_refused(self):
+        (self.path / 'mcp-tokens').write_text('test-mcp-token approval-required\n')
+        out = self.cli('say', 'test-thread', 'Go', '--full-access', '--execute', '--model', 'claudeAgent:other', success=False)
+        self.assertIn('runtime_mode_escalation_denied', out.stderr)
+        self.assertEqual((self.thread['runtimeMode'], self.thread['interactionMode']), ('approval-required', 'plan'))
+        self.assertEqual(self.thread['modelSelection'], {'instanceId': 'codex', 'model': 'test'})
+
+    def test_a_refused_dispatch_is_not_a_replay(self):
+        self.thread['archivedAt'] = '2026-09-08T00:00:00.000Z'      # T3 refuses the send: thread_not_sendable
+        self.cli('say', 'test-thread', 'x', '--expect-turn', 'old', '--dispatch-id', 'refused-key-01', success=False)
+        self.thread['archivedAt'] = None
+        self.thread['runs'].append({'id': 'someone-else', 'status': 'completed', 'userMessageId': 'm'})
+        out = self.cli('say', 'test-thread', 'x', '--expect-turn', 'old', '--dispatch-id', 'refused-key-01', success=False)
+        self.assertIn('has moved past turn old', out.stderr)
+        self.assertEqual(self.sent('mcp.t3_thread_send'), [])
+
+    def test_an_unusable_ledger_refuses_to_dispatch(self):
+        (self.path / 'token.mcp.dispatches').write_text('not json\n')
+        out = self.cli('say', 'test-thread', 'x', success=False)
+        self.assertIn('is not valid', out.stderr)
+        self.env['T3CTL_DISPATCH_LEDGER'] = str(self.path / 'token' / 'ledger')   # a file where its directory should be
+        out = self.cli('say', 'test-thread', 'x', success=False)
+        self.assertIn('refused to dispatch', out.stderr)
+        self.assertEqual(self.sent(), [])
+
     def test_finite_cap_above_one_item_still_marks_truncation(self):
         self.thread['messages'] = [{'role': 'assistant', 'text': 'y' * 90000, 'runId': 'old'}]
         self.env['T3CTL_TEXT_CAP'] = '80000'

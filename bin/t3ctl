@@ -271,6 +271,7 @@ mint_token() {
 }
 
 mcp_token() {
+  if [ -n "${MCP_PINNED:-}" ]; then printf '%s' "$MCP_PINNED"; return 0; fi
   if [ ! -s "$MCP_TOKEN_FILE" ]; then
     [ "$TOKEN_MODE" = self ] || die "cannot read $MCP_TOKEN_FILE (the MCP credential, root only; mint both with: systemctl start t3-token-renew)"
     mint_token mcp "" || die "could not mint the MCP credential"
@@ -299,6 +300,12 @@ mcp_raw() {
       MCP_OUT=$(T3CTL_URL="$BASE" T3CTL_MCP_BEARER="$tok" "$T3MCP" "$@" 2>"$errf"); MCP_RC=$?
     fi
     MCP_ERR=$(cat "$errf")
+    if [ "$MCP_RC" = 3 ] && [[ $MCP_ERR == *"HTTP 401"* || $MCP_ERR == *"HTTP 403"* ]] && [ -n "${MCP_PINNED:-}" ]; then
+      # Mid-dispatch: an earlier attempt may have been accepted, and a fresh
+      # credential would not de-duplicate it. Stop instead of re-sending.
+      MCP_ERR="$MCP_ERR (the MCP credential was revoked mid-dispatch: this dispatch may be partly sent — check the thread with t3ctl last/show before sending it again)"
+      break
+    fi
     if [ "$MCP_RC" = 3 ] && [[ $MCP_ERR == *"HTTP 401"* || $MCP_ERR == *"HTTP 403"* ]] && [ "$TOKEN_MODE" = self ] && [ "$attempt" = 1 ]; then
       mint_token mcp "$tok" || { rm -f "$errf" ${inf:+"$inf"}; die "MCP refused the credential and re-minting it failed"; }
       tok=$(mcp_token) || exit 1
@@ -367,30 +374,63 @@ check_ceiling() { # $1 mode a thread will run in → refuse before anything is c
 
 # Dispatch ledger. T3 de-duplicates a clientRequestId only within the
 # credential that sent it, so a --dispatch-id replay after the MCP token was
-# rotated would create new work. Each dispatch is recorded (id, kind,
+# rotated would create new work. Every dispatch is reserved (id, kind,
 # target, a fingerprint of the credential — never the credential) before it
-# is sent; a replay under another credential is refused instead of duplicated.
+# is sent and marked accepted once T3 returns its receipt. Lookup,
+# validation and reservation happen under one lock; a ledger that cannot be
+# read, locked or written refuses the dispatch rather than sending it
+# unprotected. Entries are kept 35 days (the MCP credential lives 30).
 LEDGER=${T3CTL_DISPATCH_LEDGER:-$MCP_TOKEN_FILE.dispatches}
-cred_fp() { mcp_token | sha256sum | cut -c1-16; }
-ledger_put() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerprint
-  ( umask 077
-    flock -w 30 7 || exit 0
-    { [ -s "$LEDGER" ] && jq -c --arg cut "$(date -u -d '-35 days' +%Y-%m-%dT%H:%M:%SZ)" 'select(.at >= $cut)' "$LEDGER" 2>/dev/null | tail -n 4999
+fingerprint() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+
+ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerprint → new|retry|replay
+  local out
+  out=$( umask 077
+    exec 7>>"$LEDGER.lock" 2>/dev/null || { echo "error:cannot open $LEDGER.lock"; exit 0; }
+    flock -w 30 7 || { echo "error:the dispatch ledger $LEDGER has been locked for 30 s"; exit 0; }
+    entry=""
+    if [ -e "$LEDGER" ]; then
+      jq -se 'all(type == "object" and has("dispatchId"))' "$LEDGER" >/dev/null 2>&1 \
+        || { echo "error:$LEDGER is not valid (move it aside to continue; replays of the dispatches in it are then unprotected)"; exit 0; }
+      entry=$(jq -c --arg d "$3" 'select(.dispatchId == $d)' "$LEDGER" | tail -1)
+    fi
+    if [ -n "$entry" ]; then
+      if [ "$(jq -r .kind <<<"$entry")" != "$1" ] || [ "$(jq -r .target <<<"$entry")" != "$2" ]; then echo "error:conflict"
+      elif [ "$(jq -r .credential <<<"$entry")" != "$4" ]; then echo "error:rotated"
+      elif [ "$(jq -r .state <<<"$entry")" = accepted ]; then echo replay
+      else echo retry; fi
+      exit 0
+    fi
+    { [ ! -s "$LEDGER" ] || jq -c --arg cut "$(date -u -d '-35 days' +%Y-%m-%dT%H:%M:%SZ)" 'select(.at >= $cut)' "$LEDGER"
       jq -cn --arg k "$1" --arg t "$2" --arg d "$3" --arg c "$4" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{dispatchId:$d, kind:$k, target:$t, credential:$c, at:$at}'; } > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
-  ) 7>"$LEDGER.lock" 2>/dev/null || echo "t3ctl: warning: could not record dispatch $3 in $LEDGER" >&2
+        '{dispatchId:$d, kind:$k, target:$t, credential:$c, state:"reserved", at:$at}'
+    } > "$LEDGER.tmp" 2>/dev/null && mv "$LEDGER.tmp" "$LEDGER" 2>/dev/null || { echo "error:cannot write $LEDGER"; exit 0; }
+    echo new
+  )
+  case $out in
+    new|retry|replay) printf '%s' "$out";;
+    error:conflict) die "refused: dispatch id $3 was already used for another $1 target; pick a new id";;
+    error:rotated) die "refused: dispatch $3 was first sent with an MCP credential that has since been rotated, and T3 only de-duplicates within one credential — read the thread (t3ctl last / show) and send again with a new dispatch id only if it is missing";;
+    error:*) die "refused to dispatch: ${out#error:}";;
+    *) die "refused to dispatch: the dispatch ledger $LEDGER is unusable";;
+  esac
 }
-replay_check() { # $1 kind, $2 target, $3 dispatch id → REPLAY=1 for a same-credential replay; sets CRED_FP
-  local entry
-  REPLAY=""; CRED_FP=$(cred_fp) || exit 1
-  [ -s "$LEDGER" ] || return 0
-  entry=$(jq -c --arg d "$3" 'select(.dispatchId == $d)' "$LEDGER" 2>/dev/null | tail -1)
-  [ -n "$entry" ] || return 0
-  [ "$(jq -r .kind <<<"$entry")" = "$1" ] && [ "$(jq -r .target <<<"$entry")" = "$2" ] \
-    || die "refused: dispatch id $3 was already used for another $(jq -r .kind <<<"$entry") target; pick a new id"
-  [ "$(jq -r .credential <<<"$entry")" = "$CRED_FP" ] \
-    || die "refused: dispatch $3 was first sent with an MCP credential that has since been rotated, and T3 only de-duplicates within one credential — read the thread (t3ctl last / show) and send again with a new dispatch id only if it is missing"
-  REPLAY=1
+
+ledger_accept() { # $1 dispatch id → mark it accepted (the work exists; failures only warn)
+  ( umask 077
+    exec 7>>"$LEDGER.lock" && flock -w 30 7 || exit 1
+    jq -c --arg d "$1" 'if .dispatchId == $d then .state = "accepted" else . end' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+  ) 2>/dev/null || echo "t3ctl: warning: could not mark dispatch $1 accepted in $LEDGER" >&2
+}
+
+begin_dispatch() { # $1 kind, $2 target, $3 dispatch id → REPLAY=1 for an accepted same-credential replay
+  # Pins the credential the ledger was checked against for every MCP call of
+  # this dispatch: no re-mint or retry under another credential mid-dispatch.
+  local tok state
+  tok=$(mcp_token) || exit 1
+  state=$(ledger_reserve "$1" "$2" "$3" "$(fingerprint "$tok")") || exit 1
+  MCP_PINNED=$tok
+  REPLAY=""; [ "$state" != replay ] || REPLAY=1
 }
 
 # ---- resolution ------------------------------------------------------------
@@ -602,9 +642,9 @@ cmd_new() {
 
   check_ceiling "$mode"
   resolve_project "$project"
-  REPLAY=""
-  if [ -n "$dispatch_id" ]; then replay_check new "$PID" "$dispatch_id"; else dispatch_id=$(uuid); CRED_FP=$(cred_fp) || exit 1; fi
-  # A replay of a dispatch that already passed the cap returns that same work.
+  [ -n "$dispatch_id" ] || dispatch_id=$(uuid)
+  begin_dispatch new "$PID" "$dispatch_id"
+  # An accepted replay of a dispatch that already passed the cap returns that same work.
   if [ -z "$REPLAY" ]; then
     local running
     running=$(mcp threads --all-projects --statuses "$ACTIVE_STATUSES" --title-contains "$TAG") || exit 1
@@ -629,7 +669,6 @@ cmd_new() {
 
   [ -n "$title" ] || title="${prompt:0:48}"
   case $title in "$TAG"*) ;; *) title="$TAG $title";; esac
-  [ -n "$REPLAY" ] || ledger_put new "$PID" "$dispatch_id" "$CRED_FP"
 
   # Created idle first: the callback contract below needs the thread id,
   # which T3 derives from the clientRequestId (a retry returns the same thread).
@@ -658,6 +697,7 @@ Run it as a plain command exactly in that form (double-quoted summary, no other 
   fi
   local sent state
   sent=$(send_message "$tid" "$prompt" "$dispatch_id") || exit 1
+  ledger_accept "$dispatch_id"
   state=$(turn_of "$(jq -r 'if .runId == null then "" else .status end' <<<"$sent")")
   jq -cn --arg id "$tid" --arg title "$title" --arg mode "$mode" --arg state "$state" --argjson sent "$sent" \
          --arg dispatch_id "$dispatch_id" --argjson msel "$msel" \
@@ -701,41 +741,52 @@ cmd_say() {
   exec 8>"$lockdir/say-$lockname.lock"
   flock -w 120 8 || die "another t3ctl say to thread $TID has held its lock for 120 s"
   resolve_thread "$TID"   # re-read: the state may have moved while we waited
-  REPLAY=""
-  if [ -n "$dispatch_id" ]; then replay_check say "$TID" "$dispatch_id"; else dispatch_id=$(uuid); CRED_FP=$(cred_fp) || exit 1; fi
-  # A same-credential replay of an accepted dispatch returns that message;
-  # its own send is what moved the thread past --expect-turn.
-  if [ -n "$expect_turn" ] && [ -z "$REPLAY" ]; then
-    local cur_turn; cur_turn=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
-    [ "$cur_turn" = "$expect_turn" ] || die "refused: thread $TID has moved past turn $expect_turn (latest is now $cur_turn) — someone else already sent a turn; read it (t3ctl last $TID) before deciding whether to send anything"
-  fi
   local cur_mode cur_imode cur_sel=""
   cur_mode=$(jq -r '.runtimeMode' <<<"$THREAD"); cur_imode=$(jq -r '.interactionMode // "default"' <<<"$THREAD")
   [ -n "$mode" ] || mode=$cur_mode
   [ -n "$imode" ] || imode=$cur_imode
   check_ceiling "$mode"   # before anything changes: MCP would refuse the message after the mode was set
   [ -z "$model" ] || msel=$(resolve_model "$model") || exit 1
+  [ -z "$msel" ] || cur_sel=$(thread_selection "$TID") || exit 1   # read before anything changes
   local old; old=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
-  [ -n "$REPLAY" ] || ledger_put say "$TID" "$dispatch_id" "$CRED_FP"
-  # Mode changes are thread state MCP will not set: legacy path, before the
-  # message. If the message is then refused, they are put back.
-  local set_mode="" set_imode=""
+  [ -n "$dispatch_id" ] || dispatch_id=$(uuid)
+  begin_dispatch say "$TID" "$dispatch_id"
+  # An accepted same-credential replay returns that message; its own send is
+  # what moved the thread past --expect-turn.
+  if [ -n "$expect_turn" ] && [ -z "$REPLAY" ]; then
+    local cur_turn; cur_turn=$(jq -r '.latestTurn.turnId // "none"' <<<"$THREAD")
+    [ "$cur_turn" = "$expect_turn" ] || die "refused: thread $TID has moved past turn $expect_turn (latest is now $cur_turn) — someone else already sent a turn; read it (t3ctl last $TID) before deciding whether to send anything"
+  fi
+  # The model is set over MCP while the modes are still the thread's own (MCP
+  # checks the thread's modes against the credential's ceiling); mode changes
+  # are thread state MCP will not set, so they go over the legacy path, last.
+  # Any failure after the first change puts back what was changed: modes
+  # first (down again), then the model.
+  local set_mode="" set_imode="" model_set=""
   [ "$mode" = "$cur_mode" ] || set_mode=$mode
   [ "$imode" = "$cur_imode" ] || set_imode=$imode
-  if [ -n "$set_mode$set_imode" ]; then legacy_set_modes "$TID" "$set_mode" "$set_imode" || exit 1; fi
+  say_restore() {
+    echo "t3ctl: the message was not sent; restoring the thread's previous settings" >&2
+    if [ -n "$set_mode$set_imode" ]; then
+      ( legacy_set_modes "$TID" "${set_mode:+$cur_mode}" "${set_imode:+$cur_imode}" ) \
+        || echo "t3ctl: warning: could not restore the thread's modes ($cur_mode/$cur_imode)" >&2
+    fi
+    if [ -n "$model_set" ]; then
+      mcp_raw call t3_thread_configure "$(jq -cn --arg t "$TID" --argjson m "$cur_sel" '{threadId:$t, modelSelection:$m}')" >/dev/null \
+        || echo "t3ctl: warning: could not restore the thread's model" >&2
+    fi
+  }
   if [ -n "$msel" ]; then
-    cur_sel=$(thread_selection "$TID") || exit 1
-    mcp call t3_thread_configure "$(jq -cn --arg t "$TID" --argjson m "$msel" '{threadId:$t, modelSelection:$m}')" >/dev/null || {
-      [ -z "$set_mode$set_imode" ] || legacy_set_modes "$TID" "${set_mode:+$cur_mode}" "${set_imode:+$cur_imode}"; exit 1; }
+    mcp_raw call t3_thread_configure "$(jq -cn --arg t "$TID" --argjson m "$msel" '{threadId:$t, modelSelection:$m}')" \
+      || mcp_fail "t3_thread_configure"   # nothing changed yet
+    model_set=1
+  fi
+  if [ -n "$set_mode$set_imode" ]; then
+    ( legacy_set_modes "$TID" "$set_mode" "$set_imode" ) || { say_restore; exit 1; }
   fi
   local sent state
-  sent=$(send_message "$TID" "$text" "$dispatch_id") || {
-    echo "t3ctl: the message was not sent; restoring the thread's previous settings" >&2
-    [ -z "$set_mode$set_imode" ] || legacy_set_modes "$TID" "${set_mode:+$cur_mode}" "${set_imode:+$cur_imode}" \
-      || echo "t3ctl: warning: could not restore the thread's modes ($cur_mode/$cur_imode)" >&2
-    [ -z "$cur_sel" ] || mcp call t3_thread_configure "$(jq -cn --arg t "$TID" --argjson m "$cur_sel" '{threadId:$t, modelSelection:$m}')" >/dev/null \
-      || echo "t3ctl: warning: could not restore the thread's model" >&2
-    exit 1; }
+  sent=$(send_message "$TID" "$text" "$dispatch_id") || { say_restore; exit 1; }
+  ledger_accept "$dispatch_id"
   state=$(turn_of "$(jq -r 'if .runId == null then "" else .status end' <<<"$sent")")
   exec 8>&-   # new run visible (or given up on): next sender may check
   jq -cn --arg id "$TID" --arg mode "$mode" --arg state "$state" --argjson sent "$sent" --arg old "$old" --arg dispatch_id "$dispatch_id" \

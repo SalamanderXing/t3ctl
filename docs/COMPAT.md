@@ -49,8 +49,13 @@ Behaviour changes callers may notice (not t3-version related):
     de-duplicates only within one credential); t3ctl keeps a ledger of
     dispatch id → kind, target, credential fingerprint in
     `T3CTL_DISPATCH_LEDGER` (default `$T3CTL_MCP_TOKEN_FILE.dispatches`,
-    0600, 35 days). A same-credential replay returns the original message
-    and skips `--expect-turn`/the running cap, which that dispatch already passed.
+    0600, 35 days), reserved under a lock before sending and marked accepted
+    on the receipt. A same-credential replay of an *accepted* dispatch
+    returns the original message and skips `--expect-turn`/the running cap,
+    which it already passed; a reserved-but-unconfirmed one is re-checked.
+    A ledger that cannot be locked, read or written refuses the dispatch.
+    Each dispatch pins its credential: a 401 mid-dispatch stops with "may be
+    partly sent" instead of re-minting and re-sending.
   - `say` checks the target mode against `T3CTL_MCP_ACCESS` before changing
     anything, and if T3 still refuses the message (a credential minted at a
     lower ceiling) it restores the modes/model it had changed.

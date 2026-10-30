@@ -381,6 +381,12 @@ def handle_mcp(handler):
         try:
             structured = call(server.state, name, args, access, hashlib.sha256(token.encode()).hexdigest()[:12])
             result = {"content": [{"type": "text", "text": json.dumps(structured)}], "structuredContent": structured}
+            if name == getattr(server, "mcp_revoke_after", None):
+                # test knob: the call was accepted, then the credential is revoked and the reply lost
+                server.mcp_revoke_after = None
+                path = Path(server.mcp_tokens_file)
+                path.write_text("".join(l + "\n" for l in path.read_text().splitlines() if l.split()[:1] != [token]))
+                return handler._json(401, {"error": "invalid_mcp_credential", "message": "revoked"})
         except Fail as e:
             result = {"content": [{"type": "text", "text": json.dumps(
                 {"_tag": "OrchestratorMcpFailure", "code": e.code, "message": e.message})}], "isError": True}
