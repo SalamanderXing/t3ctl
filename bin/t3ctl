@@ -383,7 +383,7 @@ check_ceiling() { # $1 mode a thread will run in → refuse before anything is c
 LEDGER=${T3CTL_DISPATCH_LEDGER:-$MCP_TOKEN_FILE.dispatches}
 fingerprint() { printf '%s' "$1" | sha256sum | cut -c1-16; }
 
-ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerprint → new|retry|replay
+ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerprint → new|retry|attempted|replay
   local out
   out=$( umask 077
     exec 7>>"$LEDGER.lock" 2>/dev/null || { echo "error:cannot open $LEDGER.lock"; exit 0; }
@@ -397,8 +397,7 @@ ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerpri
     if [ -n "$entry" ]; then
       if [ "$(jq -r .kind <<<"$entry")" != "$1" ] || [ "$(jq -r .target <<<"$entry")" != "$2" ]; then echo "error:conflict"
       elif [ "$(jq -r .credential <<<"$entry")" != "$4" ]; then echo "error:rotated"
-      elif [ "$(jq -r .state <<<"$entry")" = accepted ]; then echo replay
-      else echo retry; fi
+      else case $(jq -r .state <<<"$entry") in accepted) echo replay;; attempted) echo attempted;; *) echo retry;; esac; fi
       exit 0
     fi
     { [ ! -s "$LEDGER" ] || jq -c --arg cut "$(date -u -d '-35 days' +%Y-%m-%dT%H:%M:%SZ)" 'select(.at >= $cut)' "$LEDGER"
@@ -408,7 +407,7 @@ ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerpri
     echo new
   )
   case $out in
-    new|retry|replay) printf '%s' "$out";;
+    new|retry|attempted|replay) printf '%s' "$out";;
     error:conflict) die "refused: dispatch id $3 was already used for another $1 target; pick a new id";;
     error:rotated) die "refused: dispatch $3 was first sent with an MCP credential that has since been rotated, and T3 only de-duplicates within one credential — read the thread (t3ctl last / show) and send again with a new dispatch id only if it is missing";;
     error:*) die "refused to dispatch: ${out#error:}";;
@@ -416,14 +415,16 @@ ledger_reserve() { # $1 kind, $2 target, $3 dispatch id, $4 credential fingerpri
   esac
 }
 
-ledger_accept() { # $1 dispatch id → mark it accepted (the work exists; failures only warn)
+ledger_mark() { # $1 dispatch id, $2 attempted|accepted (failures only warn: the entry stays protective)
   ( umask 077
     exec 7>>"$LEDGER.lock" && flock -w 30 7 || exit 1
-    jq -c --arg d "$1" 'if .dispatchId == $d then .state = "accepted" else . end' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
-  ) 2>/dev/null || echo "t3ctl: warning: could not mark dispatch $1 accepted in $LEDGER" >&2
+    jq -c --arg d "$1" --arg st "$2" 'if .dispatchId == $d then .state = $st else . end' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+  ) 2>/dev/null || echo "t3ctl: warning: could not mark dispatch $1 $2 in $LEDGER" >&2
 }
+ledger_accept() { ledger_mark "$1" accepted; }
 
-begin_dispatch() { # $1 kind, $2 target, $3 dispatch id → REPLAY=1 for an accepted same-credential replay
+begin_dispatch() { # $1 kind, $2 target, $3 dispatch id → REPLAY=1 for an accepted same-credential replay,
+  #                  ATTEMPTED=1 when an earlier send of this id may have been accepted (outcome unknown)
   # Pins the credential the ledger was checked against for every MCP call of
   # this dispatch: no re-mint or retry under another credential mid-dispatch.
   local tok state
@@ -431,6 +432,7 @@ begin_dispatch() { # $1 kind, $2 target, $3 dispatch id → REPLAY=1 for an acce
   state=$(ledger_reserve "$1" "$2" "$3" "$(fingerprint "$tok")") || exit 1
   MCP_PINNED=$tok
   REPLAY=""; [ "$state" != replay ] || REPLAY=1
+  ATTEMPTED=""; [ "$state" != attempted ] || ATTEMPTED=1
 }
 
 # ---- resolution ------------------------------------------------------------
@@ -696,6 +698,7 @@ Callback contract (from the dispatcher, not the task): this t3 thread's id is $t
 Run it as a plain command exactly in that form (double-quoted summary, no other shell syntax): that exact command is pre-approved and runs without a prompt even in approval-required mode. Notify on those state changes only — not for progress updates. Also: never schedule recurring jobs (cron, timers, self-reminders) from inside this session; they die with it. If the work needs something recurring, say so in your callback and it will be scheduled properly outside."
   fi
   local sent state
+  ledger_mark "$dispatch_id" attempted
   sent=$(send_message "$tid" "$prompt" "$dispatch_id") || exit 1
   ledger_accept "$dispatch_id"
   state=$(turn_of "$(jq -r 'if .runId == null then "" else .status end' <<<"$sent")")
@@ -763,9 +766,10 @@ cmd_say() {
   # Any failure after the first change puts back what was changed: modes
   # first (down again), then the model.
   local set_mode="" set_imode="" model_set=""
-  # An accepted replay only recovers its receipt: the settings it asked for
-  # were applied then, and re-applying them now could undo a later dispatch's.
-  if [ -z "$REPLAY" ]; then
+  # An accepted replay, or a retry of a send that may have been accepted,
+  # only recovers its receipt: the settings it asked for were applied then,
+  # and re-applying them now could undo a later dispatch's.
+  if [ -z "$REPLAY$ATTEMPTED" ]; then
     [ "$mode" = "$cur_mode" ] || set_mode=$mode
     [ "$imode" = "$cur_imode" ] || set_imode=$imode
   else
@@ -791,12 +795,16 @@ cmd_say() {
     ( legacy_set_modes "$TID" "$set_mode" "$set_imode" ) || { say_restore; exit 1; }
   fi
   local sent state
-  # Only a definite refusal (T3's typed failure, exit 2) proves the message was
-  # not accepted; after a transport error or lost reply it may be running, so
-  # the requested settings stay and the caller is told delivery is uncertain.
+  # Only a refusal T3 makes before accepting (the codes below) proves the
+  # message was not sent. After any other failure (a transport error, a lost
+  # reply, orchestration_error, which T3 can return after dispatching) it may
+  # be running: the requested settings stay, the caller is told delivery is
+  # uncertain, and the ledger marks the id attempted so a retry changes nothing.
+  ledger_mark "$dispatch_id" attempted
   if ! mcp_raw call t3_thread_send - --retry < <(printf '%s' "$text" | jq -Rsc --arg tid "$TID" --arg rid "$dispatch_id" \
         '{threadId:$tid, message:., mode:"queue", clientRequestId:$rid}'); then
-    if [ "$MCP_RC" = 2 ]; then
+    if [ "$MCP_RC" = 2 ] && [[ $(jq -r '.code // ""' <<<"$MCP_ERR" 2>/dev/null) =~ ^(runtime_mode_escalation_denied|interaction_mode_escalation_denied|capability_denied|thread_not_found|thread_not_sendable|invalid_request|parent_not_active)$ ]]; then
+      ledger_mark "$dispatch_id" reserved   # refused outright: nothing of it exists
       local send_rc=$MCP_RC send_err=$MCP_ERR   # say_restore's own calls overwrite them
       say_restore; MCP_RC=$send_rc; MCP_ERR=$send_err; mcp_fail t3_thread_send
     fi

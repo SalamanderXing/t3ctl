@@ -473,6 +473,23 @@ class TransportTest(unittest.TestCase):
         self.assertEqual((self.thread['interactionMode'], self.thread['modelSelection']['model']), ('plan', 'model-b'))
         self.assertEqual(len(self.sent('mcp.t3_thread_send')), 2)
 
+    def test_orchestration_error_is_not_proof_of_non_delivery(self):
+        self.thread['runtimeMode'] = 'full-access'
+        real = __import__('fake_t3_mcp')._call
+        def accept_then_fail(state, name, args, access, ns):
+            out = real(state, name, args, access, ns)
+            if name == 't3_thread_send' and args.get('clientRequestId') == 'uncertain-0001':
+                raise __import__('fake_t3_mcp').Fail('orchestration_error', 'projection read failed')
+            return out
+        with patch('fake_t3_mcp._call', accept_then_fail):
+            out = self.cli('say', 'test-thread', 'Go', '--mode', 'approval-required', '--dispatch-id', 'uncertain-0001', success=False)
+            self.assertIn('delivery of dispatch', out.stderr)
+            self.assertEqual(self.thread['runtimeMode'], 'approval-required')
+            # a later dispatch changes settings; retrying the uncertain one must not undo them
+            self.cli('say', 'test-thread', 'B', '--plan')
+            out = self.cli('say', 'test-thread', 'Go', '--mode', 'auto', '--execute', '--dispatch-id', 'uncertain-0001', success=False)
+        self.assertEqual((self.thread['runtimeMode'], self.thread['interactionMode']), ('approval-required', 'plan'))
+
     def test_a_refused_dispatch_is_not_a_replay(self):
         self.thread['archivedAt'] = '2026-09-08T00:00:00.000Z'      # T3 refuses the send: thread_not_sendable
         self.cli('say', 'test-thread', 'x', '--expect-turn', 'old', '--dispatch-id', 'refused-key-01', success=False)
