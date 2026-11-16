@@ -80,6 +80,7 @@ ln -s "$ROOT/bin/t3-notify" "$TMP/bin/t3-notify"
 # V2 run-correlation schema stand-in (the columns bin/t3-events' `managed` reads)
 sqlite3 "$TMP/t3home/userdata/statev2.sqlite" <<'SQL'
 CREATE TABLE orchestration_v2_projection_runs(run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, payload_json TEXT);
+CREATE TABLE orchestration_v2_projection_messages(message_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, run_id TEXT, node_id TEXT, role TEXT NOT NULL, streaming INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);
 SQL
 
 python3 "$ROOT/tests/fake_t3_server.py" --port "$PORT" --tokens-file "$TOKENS" --mcp-tokens-file "$MCP_TOKENS" \

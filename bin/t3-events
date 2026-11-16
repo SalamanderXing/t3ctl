@@ -12,6 +12,16 @@ message → run mapping the SQL below reads). `managed` and `turn` still read
 t3's SQLite read-only: `managed` runs inside the coding session (t3-notify,
 as the t3 user), which must not hold a t3ctl credential.
 
+Follow-up turns: a thread often keeps working after the dispatched turn ends —
+a subagent or delegated-task result, a PR-watch CI notice or a background
+command starts a new turn with no dispatch. After the dispatched turn ends the
+subscription keeps following the thread (last_status 'following') and reports
+each such turn's terminal state (or pending request) to the same session,
+marked "origin": "self". It stops when a human/desktop message or another
+sender's dispatch starts a turn, a new dispatch registers, the thread has been
+idle (no run, no active child thread) for T3CTL_EVENTS_FOLLOW_IDLE_HOURS, or
+T3CTL_EVENTS_FOLLOW_CAP events were sent (then one "monitoring-stopped" event).
+
 Every registration decision is logged, one JSON line, beside the events DB
 (t3ctl-events.log): which HERMES_SESSION_* variables were present (names,
 never values) and, for a manual fallback, why.
@@ -32,7 +42,79 @@ import subprocess
 import time
 
 logger = logging.getLogger(__name__)
-TERMINAL = ('completed', 'error', 'interrupted', 'not-visible', 'superseded', 'monitoring-failed')
+TERMINAL = ('completed', 'error', 'interrupted', 'not-visible', 'superseded', 'monitoring-failed', 'released')
+# A dispatched turn that ends this way hands over to follow mode (when enabled).
+FOLLOW_FROM = ('completed', 'error', 'interrupted')
+# Turns started this way end follow mode: someone else now drives the thread.
+STOP_KINDS = ('human', 'dispatch')
+FOLLOW_COLUMNS = (('follow_turn', 'TEXT'), ('follow_events', 'INTEGER NOT NULL DEFAULT 0'),
+                  ('follow_activity', 'REAL'), ('follow_reason', 'TEXT'))
+
+
+def follow_config(env=None):
+    """Follow-mode settings (gateway environment; `managed` reads FOLLOW too)."""
+    env = os.environ if env is None else env
+
+    def number(name, default, cast=float):
+        try:
+            value = cast(env.get(name, default))
+            return value if value >= 0 else default
+        except (TypeError, ValueError):
+            return default
+    pr_watch = env.get('T3CTL_EVENTS_FOLLOW_PR_WATCH', 'compact')
+    return {'enabled': env.get('T3CTL_EVENTS_FOLLOW', '1') != '0',
+            'idle': number('T3CTL_EVENTS_FOLLOW_IDLE_HOURS', 6.0) * 3600,
+            'cap': number('T3CTL_EVENTS_FOLLOW_CAP', 20, int),
+            'interval': number('T3CTL_EVENTS_FOLLOW_INTERVAL', 30.0),
+            'pr_watch': pr_watch if pr_watch in ('compact', 'full', 'skip') else 'compact',
+            'compact_chars': number('T3CTL_EVENTS_FOLLOW_COMPACT_CHARS', 600, int)}
+
+
+def start_kind(run, own_message=None):
+    """Who started a run, from its starting message (t3ctl origins / T3's SQLite).
+
+    T3 records it on the message: createdBy user|agent, creationSource
+    web|mobile|mcp|server|provider, and the id's prefix for server-made ones.
+      human        a person typed it (desktop/web/mobile): they took over
+      dispatch     another MCP sender's message (an unregistered say)
+      pr-watch     T3's PR-watch notice (CI, reviews, merges)
+      notification subagent / delegated-task result, background command, monitor
+      answer       the answer to a pending question (async-answer:)
+      scheduled    a T3 scheduled task
+      restart      T3's restart continuation
+      agent        any other agent/server-made message
+      own-dispatch the registered dispatch's own message
+      unknown      nothing recorded (followed: never hide a turn on a guess)
+    """
+    mid = run.get('startMessageId') or ''
+    if not run.get('startType') and not mid:
+        return 'unknown'
+    for prefix, kind in (('message:pr-watch:', 'pr-watch'), ('message:restart-', 'restart'),
+                         ('async-answer:', 'answer'), ('scheduled-task-message:', 'scheduled')):
+        if mid.startswith(prefix):
+            return kind
+    if run.get('startType') == 'notification':
+        return 'notification'
+    if run.get('creationSource') == 'mcp':
+        return 'own-dispatch' if own_message and mid == own_message else 'dispatch'
+    if run.get('createdBy') == 'user':
+        return 'human'
+    return 'agent'
+
+
+def never_started(run):
+    """A queued run cancelled before it began (T3 folds its message into the run in progress)."""
+    return run.get('status') == 'cancelled' and not run.get('startedAt')
+
+
+def stop_kind(run, own_message=None):
+    """The kind that ends a follow, if this run's start or any user message T3
+    folded into it (a person typing while the turn ran) is one; else None."""
+    for part in [run, *run.get('messages', [])]:
+        kind = start_kind(part, own_message)
+        if kind in STOP_KINDS:
+            return kind
+    return None
 
 
 def database_path():
@@ -52,13 +134,22 @@ def connect(path=None):
                 parent_session_id TEXT NOT NULL, session_key TEXT NOT NULL,
                 previous_turn TEXT NOT NULL, message_id TEXT NOT NULL, turn_id TEXT, created_at REAL NOT NULL,
                 last_status TEXT NOT NULL DEFAULT 'running',
-                poll_failures INTEGER NOT NULL DEFAULT 0, next_poll REAL NOT NULL DEFAULT 0);
+                poll_failures INTEGER NOT NULL DEFAULT 0, next_poll REAL NOT NULL DEFAULT 0,
+                follow_turn TEXT, follow_events INTEGER NOT NULL DEFAULT 0, follow_activity REAL, follow_reason TEXT);
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, dispatch_id TEXT NOT NULL,
                 payload TEXT NOT NULL, created_at REAL NOT NULL,
                 disposition TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0);
         ''')
+        columns = {row[1] for row in db.execute('PRAGMA table_info(subscriptions)')}
+        for name, declaration in FOLLOW_COLUMNS:   # databases from before follow mode
+            if name not in columns:
+                try:
+                    db.execute(f'ALTER TABLE subscriptions ADD COLUMN {name} {declaration}')
+                except sqlite3.OperationalError as exc:
+                    if 'duplicate column' not in str(exc):
+                        raise
         with db:
             yield db
     finally:
@@ -160,8 +251,10 @@ def register(receipt, env=None, path=None):
                 ON CONFLICT(thread_id) DO UPDATE SET
                 parent_session_id=excluded.parent_session_id, session_key=excluded.session_key,
                 previous_turn=excluded.previous_turn, message_id=excluded.message_id, turn_id=excluded.turn_id,
-                created_at=excluded.created_at, last_status='running', poll_failures=0, next_poll=0
-                WHERE subscriptions.dispatch_id = excluded.dispatch_id''',
+                created_at=excluded.created_at, last_status='running', poll_failures=0, next_poll=0,
+                follow_turn=NULL, follow_events=0, follow_activity=NULL, follow_reason=NULL
+                WHERE subscriptions.dispatch_id = excluded.dispatch_id
+                AND subscriptions.last_status NOT IN ('following', 'released')''',
                 (receipt['threadId'], receipt['dispatchId'], sid, key,
                  receipt['previousTurnId'], receipt['messageId'], None, time.time()))
             owner = db.execute('SELECT dispatch_id FROM subscriptions WHERE thread_id=?', (receipt['threadId'],)).fetchone()
@@ -180,7 +273,8 @@ def register(receipt, env=None, path=None):
             ON CONFLICT(thread_id) DO UPDATE SET dispatch_id=excluded.dispatch_id,
             parent_session_id=excluded.parent_session_id, session_key=excluded.session_key,
             previous_turn=excluded.previous_turn, message_id=excluded.message_id, turn_id=excluded.turn_id,
-            created_at=excluded.created_at, last_status='running', poll_failures=0, next_poll=0 ''',
+            created_at=excluded.created_at, last_status='running', poll_failures=0, next_poll=0,
+            follow_turn=NULL, follow_events=0, follow_activity=NULL, follow_reason=NULL ''',
             (receipt['threadId'], receipt['dispatchId'], sid, key,
              receipt['previousTurnId'], receipt['messageId'], None, time.time()))
         db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id!=? AND disposition='pending'",
@@ -188,8 +282,13 @@ def register(receipt, env=None, path=None):
     return True
 
 
-def observe(subscription, state, path=None, clock=time.time):
-    """Translate typed state into one event per turn/state/request set."""
+def observe(subscription, state, path=None, clock=time.time, follow=None):
+    """Translate typed state into one event per turn/state/request set.
+
+    The dispatched turn's end (completed/error/interrupted) also starts
+    follow mode, when enabled: later self-started turns are follow_poll's.
+    """
+    follow = follow_config()['enabled'] if follow is None else follow
     turn = state.get('turnId')
     reason = state['reason']
     status = state.get('turn', 'running')
@@ -213,17 +312,24 @@ def observe(subscription, state, path=None, clock=time.time):
     request_ids = sorted(str(r.get('requestId') or r.get('payload', {}).get('requestId')) for r in requests)
     identity = json.dumps([subscription['dispatch_id'], turn, status, request_ids])
     event_id = hashlib.sha256(identity.encode()).hexdigest()
-    payload = {'threadId': subscription['thread_id'], 'turnId': turn, 'status': status,
+    origin = 'self' if subscription.get('last_status') == 'following' else 'dispatch'
+    payload = {'threadId': subscription['thread_id'], 'turnId': turn, 'status': status, 'origin': origin,
                'requests': requests, 'lastAssistant': state.get('lastAssistant') if status not in ('superseded', 'not-visible') else None,
                'lastError': state.get('lastError')}
     with connect(path) as db:
         current = db.execute('SELECT dispatch_id FROM subscriptions WHERE thread_id=?', (subscription['thread_id'],)).fetchone()
         if current is None or current['dispatch_id'] != subscription['dispatch_id']:
             return
-        db.execute('UPDATE subscriptions SET turn_id=COALESCE(turn_id, ?), last_status=? WHERE thread_id=?',
-                   (turn, status, subscription['thread_id']))
-        db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id=? AND id!=? AND disposition='pending'",
-                   (subscription['thread_id'], subscription['dispatch_id'], event_id))
+        if follow and origin == 'dispatch' and status in FOLLOW_FROM and turn:
+            db.execute('''UPDATE subscriptions SET turn_id=COALESCE(turn_id, ?), last_status='following',
+                follow_turn=?, follow_events=0, follow_activity=?, follow_reason=NULL WHERE thread_id=?''',
+                       (turn, turn, clock(), subscription['thread_id']))
+        else:
+            db.execute('UPDATE subscriptions SET turn_id=COALESCE(turn_id, ?), last_status=? WHERE thread_id=?',
+                       (turn, status, subscription['thread_id']))
+        if origin == 'dispatch':   # a follow's undelivered turn reports stay: each is its own news
+            db.execute("UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id=? AND id!=? AND disposition='pending'",
+                       (subscription['thread_id'], subscription['dispatch_id'], event_id))
         db.execute('INSERT OR IGNORE INTO events (id, thread_id, dispatch_id, payload, created_at) VALUES (?, ?, ?, ?, ?)',
                    (event_id, subscription['thread_id'], subscription['dispatch_id'], json.dumps(payload), clock()))
 
@@ -253,39 +359,256 @@ def dispatch_turn(thread_id, message_id, source_path=None):
         return rows[0][0] if rows else None
 
 
+RUNS_AFTER = ("SELECT r.ordinal, json_extract(r.payload_json, '$.userMessageId'), m.payload_json "
+              "FROM orchestration_v2_projection_runs r LEFT JOIN orchestration_v2_projection_messages m "
+              "ON m.message_id = json_extract(r.payload_json, '$.userMessageId') "
+              "WHERE r.thread_id=? AND r.ordinal>? ORDER BY r.ordinal")
+# user messages T3 put into those runs after they began (a person typing while a turn ran)
+FOLDED_AFTER = ("SELECT m.message_id, m.payload_json FROM orchestration_v2_projection_messages m "
+                "JOIN orchestration_v2_projection_runs r ON r.run_id = m.run_id "
+                "WHERE r.thread_id=? AND r.ordinal>? AND m.role='user'")
+
+
+def message_part(message_id, message):
+    message = json.loads(message)
+    return {'startType': 'notification' if message.get('notification') else 'user_message', 'startMessageId': message_id,
+            'createdBy': message.get('createdBy'), 'creationSource': message.get('creationSource')}
+
+
 def managed(thread_id, path=None, source_path=None):
+    """Whether the relay reports this thread's current turn (t3-notify then stays quiet).
+
+    While the dispatched turn is the latest, as before. After it, while the
+    relay follows the thread: every later turn was started by the thread
+    itself (subagent, delegated task, PR watch, …), none by a person or by
+    another sender. Anything unreadable answers False: a duplicate legacy
+    callback is better than none.
+    """
     if os.environ.get('T3CTL_EVENTS_ENABLED') == '0' or not Path(path or database_path()).exists():
         return False
     with connect(path) as db:
-        row = db.execute('SELECT message_id FROM subscriptions WHERE thread_id=?', (thread_id,)).fetchone()
+        row = db.execute('SELECT message_id, last_status FROM subscriptions WHERE thread_id=?', (thread_id,)).fetchone()
     if row is None:
         return False
     # A turn started through the desktop can also take over without registration:
-    # managed only while the thread's latest run is the one our message started.
+    # managed only while the thread's latest run is the one our message started,
+    # or one the thread started itself while the relay follows it.
     with t3_database(source_path) as db:
         latest = db.execute('''SELECT json_extract(payload_json, '$.userMessageId') FROM orchestration_v2_projection_runs
             WHERE thread_id=? ORDER BY ordinal DESC LIMIT 1''', (thread_id,)).fetchone()
-        return latest is not None and latest[0] == row['message_id']
+        if latest is not None and latest[0] == row['message_id']:
+            return True
+        if not follow_config()['enabled'] or row['last_status'] in TERMINAL or latest is None:
+            return False
+        ours = db.execute("SELECT ordinal FROM orchestration_v2_projection_runs WHERE thread_id=? "
+                          "AND json_extract(payload_json, '$.userMessageId')=?", (thread_id, row['message_id'])).fetchone()
+        if ours is None:
+            return False
+        try:
+            later = db.execute(RUNS_AFTER, (thread_id, ours[0])).fetchall()
+            folded = db.execute(FOLDED_AFTER, (thread_id, ours[0])).fetchall()
+        except sqlite3.Error:
+            return False
+    if not later or any(message is None for _, _, message in later):
+        return False
+    kinds = [start_kind(message_part(mid, message), row['message_id']) for _, mid, message in later]
+    kinds += [start_kind(message_part(mid, message), row['message_id']) for mid, message in folded]
+    if any(kind in STOP_KINDS or kind == 'unknown' for kind in kinds):
+        return False
+    # the relay sends nothing for a skipped PR-watch turn: let its own callback through
+    return not (kinds[len(later) - 1] == 'pr-watch' and follow_config()['pr_watch'] == 'skip')
+
+
+def t3ctl_json(cli, *args):
+    result = subprocess.run([cli, *args], capture_output=True, text=True, timeout=150, check=True,
+                            # the reply is injected into a conversation: bounded, unlike piped t3ctl output
+                            env={**os.environ, 'T3CTL_TEXT_CAP': os.environ.get('T3CTL_EVENTS_TEXT_CAP', '20000')})
+    return json.loads(result.stdout)
+
+
+def superseded(subscription, state):
+    return state.get('reason') == 'superseded' or (
+        state.get('reason') != 'not-visible' and bool(subscription['turn_id']) and state.get('turnId') != subscription['turn_id'])
+
+
+def follow_from_supersession(subscription, path=None, cli='t3ctl', clock=time.time):
+    """The dispatched turn was overtaken before the relay saw it end. When every
+    later turn is the thread's own (a subagent result, a PR watch, …), that is
+    not a takeover: report the dispatched turn's own end, as if seen in time,
+    and follow from it, instead of reporting `superseded`. Returns True when
+    it handled the observation (also while the dispatched turn still runs)."""
+    out = t3ctl_json(cli, 'origins', subscription['thread_id'], '--message-id', subscription['message_id'], '--classify')
+    ours = out.get('afterRun')
+    later = [r for r in out.get('runs') or [] if not never_started(r)]
+    if ours is None or not out.get('classified') or not (out.get('runs') or []):
+        return False
+    if stop_kind({'messages': ours.get('messages', [])}) or any(stop_kind(r, subscription['message_id']) for r in later):
+        return False   # a person (or another sender) took over: `superseded`, as before
+    if ours['state'] == 'running':
+        return True    # it still runs behind a queued turn: report it when it ends
+    observe(subscription, {'turnId': ours['runId'], 'reason': 'settled', 'turn': ours['state'],
+                           'lastAssistant': ours.get('lastAssistant'), 'lastError': ours.get('lastError')},
+            path, clock, follow=True)
+    return True
+
+
+def release(subscription, reason, path=None):
+    """Stop following; nothing is sent (except for the cap, see follow_poll)."""
+    with connect(path) as db:
+        db.execute("UPDATE subscriptions SET last_status='released', follow_reason=? "
+                   "WHERE thread_id=? AND dispatch_id=? AND last_status='following'",
+                   (reason, subscription['thread_id'], subscription['dispatch_id']))
+    logger.info('stopped following %s: %s', subscription['thread_id'], reason)
+
+
+def follow_record(subscription, turn, payload=None, identity=None, advance=False, path=None, clock=time.time, touch=True):
+    """One follow-mode step, atomically and only while this dispatch still follows
+    the thread: optionally add an event (idempotent by identity), optionally
+    mark `turn` as accounted for. Returns the follow-event count, or None when
+    the subscription moved on (a new dispatch, a release)."""
+    with connect(path) as db:
+        current = db.execute('SELECT dispatch_id, last_status, follow_events FROM subscriptions WHERE thread_id=?',
+                             (subscription['thread_id'],)).fetchone()
+        if current is None or current['dispatch_id'] != subscription['dispatch_id'] or current['last_status'] != 'following':
+            return None
+        count = current['follow_events']
+        if payload is not None:
+            event_id = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+            payload = {**payload, 'follow': {**payload.get('follow', {}), 'count': count + 1}}
+            added = db.execute('INSERT OR IGNORE INTO events (id, thread_id, dispatch_id, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+                               (event_id, subscription['thread_id'], subscription['dispatch_id'], json.dumps(payload), clock())).rowcount
+            if added:
+                count += 1
+                if turn:   # a turn's newer state replaces its stale pending one (an answered question)
+                    db.execute('''UPDATE events SET disposition='superseded' WHERE thread_id=? AND dispatch_id=? AND id!=?
+                        AND disposition='pending' AND json_extract(payload, '$.turnId')=?
+                        AND json_extract(payload, '$.origin') = 'self' ''',
+                               (subscription['thread_id'], subscription['dispatch_id'], event_id, turn))
+        db.execute('''UPDATE subscriptions SET follow_events=?, follow_activity=CASE WHEN ? THEN ? ELSE follow_activity END,
+            follow_turn=CASE WHEN ? THEN ? ELSE follow_turn END WHERE thread_id=? AND dispatch_id=?''',
+                   (count, int(touch), clock(), int(advance), turn, subscription['thread_id'], subscription['dispatch_id']))
+    return count
+
+
+def follow_payload(subscription, run, kind, status, config, requests=(), last_assistant=None, last_error=None):
+    compact = kind == 'pr-watch' and config['pr_watch'] == 'compact'
+    if compact and last_assistant and len(last_assistant) > config['compact_chars']:
+        last_assistant = (last_assistant[:config['compact_chars']]
+                          + f"…[compact PR-watch event: t3ctl last {subscription['thread_id']} for the full reply]")
+    return {'threadId': subscription['thread_id'], 'turnId': run['runId'], 'status': status, 'origin': 'self',
+            'startKind': kind, 'startMessageId': run.get('startMessageId'), 'startSummary': run.get('startSummary'),
+            'requests': list(requests), 'lastAssistant': last_assistant, 'lastError': last_error,
+            'compact': compact, 'follow': {'cap': config['cap']}}
+
+
+def follow_poll(subscription, path=None, cli='t3ctl', clock=time.time, config=None):
+    """Report the turns the thread started by itself since follow_turn.
+
+    One cheap read while a turn runs; a turn's start is classified, and its
+    reply read, once it has ended (or asks for something). Turns are reported
+    in order, so a quick succession (queued PR-watch notices) loses none."""
+    config = config or follow_config()
+    tid = subscription['thread_id']
+    since = subscription['follow_activity'] or subscription['created_at']
+    idle_due = clock() - since >= config['idle']
+    out = t3ctl_json(cli, 'origins', tid, '--after-turn', subscription['follow_turn'], *(['--children'] if idle_due else []))
+    runs = out.get('runs') or []
+    if out.get('afterFound') is False:   # the followed turn is gone from T3's recent runs: lost track
+        release(subscription, 'lost', path)
+        return
+    while runs and never_started(runs[0]):   # never ran (its message went into another run): nothing to report
+        if follow_record(subscription, runs[0]['runId'], advance=True, path=path, clock=clock, touch=False) is None:
+            return
+        runs = runs[1:]
+    if not runs:
+        if idle_due and not out.get('activeRunId') and not out.get('activeChildren'):
+            release(subscription, 'idle', path)
+        return
+    if not out.get('classified'):   # turns still running and asking nothing: nothing to report yet
+        follow_record(subscription, None, path=path, clock=clock)
+        return
+    for index, run in enumerate(runs):
+        if never_started(run):
+            if follow_record(subscription, run['runId'], advance=True, path=path, clock=clock) is None:
+                return
+            continue
+        kind = start_kind(run, subscription['message_id'])
+        stop = stop_kind(run, subscription['message_id'])
+        if stop:
+            release(subscription, stop, path)
+            return
+        if run['state'] == 'running':
+            if index == len(runs) - 1 and out.get('pendingRequestCount'):
+                state = t3ctl_json(cli, 'watch', tid, '--timeout', '0', '--after-turn', subscription['follow_turn'])
+                status = state.get('reason')
+                if state.get('turnId') == run['runId'] and status in ('pending-approval', 'pending-user-input'):
+                    requests = (state.get('userInputs', []) if status == 'pending-user-input' else state.get('approvals', []))
+                    ids = sorted(str(r.get('requestId') or r.get('payload', {}).get('requestId')) for r in requests)
+                    count = follow_record(subscription, run['runId'],
+                                          follow_payload(subscription, run, kind, status, config, requests),
+                                          [subscription['dispatch_id'], run['runId'], status, ids], path=path, clock=clock)
+                    if count is not None and config['cap'] and count >= config['cap']:
+                        stop_at_cap(subscription, run, config, path, clock)
+                    return
+            follow_record(subscription, None, path=path, clock=clock)
+            return
+        status = run['state']   # completed | error | interrupted
+        if kind == 'pr-watch' and config['pr_watch'] == 'skip':
+            count = follow_record(subscription, run['runId'], advance=True, path=path, clock=clock)
+        else:
+            count = follow_record(subscription, run['runId'],
+                                  follow_payload(subscription, run, kind, status, config,
+                                                 last_assistant=run.get('lastAssistant'), last_error=run.get('lastError')),
+                                  [subscription['dispatch_id'], run['runId'], status, []], advance=True, path=path, clock=clock)
+        if count is None:
+            return
+        if config['cap'] and count >= config['cap']:
+            stop_at_cap(subscription, run, config, path, clock)
+            return
+
+
+def stop_at_cap(subscription, run, config, path=None, clock=time.time):
+    with connect(path) as db:
+        current = db.execute('SELECT dispatch_id, last_status FROM subscriptions WHERE thread_id=?', (subscription['thread_id'],)).fetchone()
+        if current is None or current['dispatch_id'] != subscription['dispatch_id'] or current['last_status'] != 'following':
+            return
+        payload = {'threadId': subscription['thread_id'], 'turnId': run['runId'], 'status': 'monitoring-stopped',
+                   'origin': 'self', 'reason': 'cap', 'requests': [], 'lastAssistant': None, 'lastError': None,
+                   'follow': {'cap': config['cap']},
+                   'note': (f"Sent {config['cap']} follow-up events for this dispatch; the relay stopped following "
+                            f"the thread. Read it with t3ctl last/show; a new dispatch starts monitoring again.")}
+        event_id = hashlib.sha256(json.dumps([subscription['dispatch_id'], 'follow-stopped', 'cap']).encode()).hexdigest()
+        db.execute('INSERT OR IGNORE INTO events (id, thread_id, dispatch_id, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+                   (event_id, subscription['thread_id'], subscription['dispatch_id'], json.dumps(payload), clock()))
+        db.execute("UPDATE subscriptions SET last_status='released', follow_reason='cap' WHERE thread_id=? AND dispatch_id=?",
+                   (subscription['thread_id'], subscription['dispatch_id']))
+    logger.info('stopped following %s: cap', subscription['thread_id'])
 
 
 def poll(path=None, cli='t3ctl'):
+    config = follow_config()
+    terminal = ','.join(f"'{status}'" for status in TERMINAL)
     with connect(path) as db:
         subscriptions = [dict(r) for r in db.execute(
-            "SELECT * FROM subscriptions WHERE next_poll<=? AND last_status NOT IN ('completed','error','interrupted','not-visible','superseded','monitoring-failed')", (time.time(),))]
+            f"SELECT * FROM subscriptions WHERE next_poll<=? AND last_status NOT IN ({terminal})", (time.time(),))]
         db.execute("DELETE FROM events WHERE disposition!='pending' AND created_at < ?", (time.time() - 7 * 86400,))
-        db.execute("DELETE FROM subscriptions WHERE last_status IN ('completed','error','interrupted','not-visible','superseded','monitoring-failed') AND created_at < ? AND NOT EXISTS (SELECT 1 FROM events WHERE events.thread_id=subscriptions.thread_id AND disposition='pending')", (time.time() - 7 * 86400,))
+        db.execute(f"DELETE FROM subscriptions WHERE last_status IN ({terminal}) AND created_at < ? AND NOT EXISTS (SELECT 1 FROM events WHERE events.thread_id=subscriptions.thread_id AND disposition='pending')", (time.time() - 7 * 86400,))
     for subscription in subscriptions:
+        following = subscription['last_status'] == 'following'
         try:
-            result = subprocess.run([cli, 'watch', subscription['thread_id'], '--timeout', '0',
-                                     '--after-turn', subscription['previous_turn'], '--message-id', subscription['message_id']],
-                                    capture_output=True, text=True, timeout=150, check=True,
-                                    # the reply is injected into a conversation: bounded, unlike piped t3ctl output
-                                    env={**os.environ, 'T3CTL_TEXT_CAP': os.environ.get('T3CTL_EVENTS_TEXT_CAP', '20000')})
-            observe(subscription, json.loads(result.stdout), path)
+            if following:
+                follow_poll(subscription, path, cli, config=config)
+            else:
+                state = t3ctl_json(cli, 'watch', subscription['thread_id'], '--timeout', '0',
+                                   '--after-turn', subscription['previous_turn'], '--message-id', subscription['message_id'])
+                if not (config['enabled'] and superseded(subscription, state)
+                        and follow_from_supersession(subscription, path, cli)):
+                    observe(subscription, state, path, follow=config['enabled'])
             with connect(path) as db:
-                db.execute('UPDATE subscriptions SET poll_failures=0, next_poll=0 WHERE thread_id=? AND dispatch_id=?',
-                           (subscription['thread_id'], subscription['dispatch_id']))
-        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+                db.execute('UPDATE subscriptions SET poll_failures=0, next_poll=? WHERE thread_id=? AND dispatch_id=?',
+                           (time.time() + config['interval'] if following else 0,
+                            subscription['thread_id'], subscription['dispatch_id']))
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning('T3 state check failed for %s: %s', subscription['thread_id'], exc)
             failures = subscription['poll_failures'] + 1
             with connect(path) as db:
@@ -357,6 +680,12 @@ async def deliver_pending(runner, path=None):
                       + json.dumps(payload, ensure_ascii=False)
                       + '\nContinue the delegated task if still relevant. Verify changed artifacts before reporting success. '
                       'Use answer for pending user input; a completed turn alone does not mean the whole task is finished.')
+            if payload.get('origin') == 'self' and (payload.get('startKind') or payload.get('status') == 'monitoring-stopped'):
+                notice += ('\nThis is a follow-up turn the thread started by itself after your dispatch (startKind: '
+                           f"{payload.get('startKind')}), not a reply to a new message from you. Report what it changed "
+                           'if it matters to the user; do not re-dispatch work it already did.'
+                           if payload.get('status') != 'monitoring-stopped' else
+                           '\nThe relay stopped following this thread (follow-up cap); check it yourself when needed.')
             accepted = await runner._dispatch_plugin_message_injection(
                 session_key=event['session_key'], content=notice, plugin_id='t3-events',
                 expected_session_id=entry.session_id)

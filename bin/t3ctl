@@ -128,6 +128,9 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
   t3ctl watch <thread> [--message-id ID] [--timeout S] [--after-turn ID]
                                           wait (server-side) until the turn settles or
                                           needs attention; prints outcome
+  t3ctl origins <thread> (--after-turn ID | --message-id ID) [--children] [--classify]
+                                          the turns after ID and what started each
+                                          (t3-events' follow-up monitoring reads this)
   t3ctl answer <thread> <requestId> --answers-file path|-
                                           answer a pending question (JSON object)
   t3ctl settle <thread>                   mark done (leave the app's inbox)
@@ -1006,6 +1009,20 @@ cmd_watch() {
                        else .text end) end)}'
 }
 
+cmd_origins() { # the relay's follow-up read: runs after a turn, what started each, their replies
+  local thread="" args=()
+  while [ $# -gt 0 ]; do case $1 in
+    --after-turn) [ -n "${2:-}" ] || die "--after-turn requires a turn id"; args+=(--after "$2"); shift 2;;
+    --message-id) [ -n "${2:-}" ] || die "--message-id requires a message id"; args+=(--after-message "$2"); shift 2;;
+    --children|--classify) args+=("$1"); shift;;
+    -*) die "unknown flag $1";;
+    *) [ -z "$thread" ] && thread=$1 || die "unexpected arg: $1"; shift;;
+  esac; done
+  [ -n "$thread" ] && [ ${#args[@]} -gt 0 ] || die "usage: t3ctl origins <thread> (--after-turn ID | --message-id ID) [--children] [--classify]"
+  resolve_thread "$thread"
+  mcp run-origins "$TID" "${args[@]}" --cap "$TEXT_CAP"; echo
+}
+
 simple_thread_cmd() { # $1: interrupt|stop|rm|settle|unsettle, then thread + flags
   local name=$1; shift
   local thread="" force=false out
@@ -1179,6 +1196,7 @@ case ${1:---help} in
   answer)     shift; cmd_answer "$@";;
   search)     shift; cmd_search "$@";;
   watch)      shift; cmd_watch "$@";;
+  origins)    shift; cmd_origins "$@";;
   approvals)  shift; cmd_approvals "$@";;
   approve)    shift; cmd_approve "$@";;
   approve-callbacks) shift; cmd_approve_callbacks "$@";;

@@ -332,6 +332,9 @@ legacy_contract_check() { # → JSON fragment for contract-check; dies on a brok
     # holds no t3ctl credential) correlates dispatches with runs here, read-only
     sqlite3 -readonly "$DB" "SELECT run_id, thread_id, ordinal, json_extract(payload_json, '\$.userMessageId') FROM orchestration_v2_projection_runs LIMIT 0;" >/dev/null 2>&1 \
       || die "run-correlation SQL schema changed (orchestration_v2_projection_runs) — see docs/COMPAT.md"
+    # … and, while it follows a thread, who started each later run (the run's user message)
+    sqlite3 -readonly "$DB" "SELECT message_id, json_extract(payload_json, '\$.createdBy'), json_extract(payload_json, '\$.creationSource'), json_extract(payload_json, '\$.notification') FROM orchestration_v2_projection_messages LIMIT 0;" >/dev/null 2>&1 \
+      || die "run-origin SQL schema changed (orchestration_v2_projection_messages) — see docs/COMPAT.md"
     db_checked=true
   fi
   jq -cn --argjson projects "$n" --argjson threads "$(jq '(.threads|length) + (.archivedThreads|length)' <<<"$raw")" \

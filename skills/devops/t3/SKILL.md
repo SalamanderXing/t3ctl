@@ -71,7 +71,11 @@ Two habits to drop, because t3ctl does them better:
 2. Read the dispatch receipt's `monitoring` field. With `events`, completion,
    error, approval and input requests return to this same conversation as a new
    turn. Continue independent work or go quiet; do not watch/list/sleep-poll.
-   A background relay checks typed T3 state without involving a model. With
+   A background relay checks typed T3 state without involving a model.
+   It keeps following the thread after your turn ends: turns the thread
+   starts by itself (a subagent or delegated task reporting back, a PR-watch
+   CI/review notice, a background command finishing) arrive as further events
+   with `"origin": "self"` (see "Follow-up events" below). With
    `manual`, use one `t3ctl watch <threadId> --message-id <messageId>` from the
    receipt. This prevents confusing the previous turn with a delayed dispatch.
    A `manual` receipt also carries `monitoringReason`, saying why events were
@@ -125,6 +129,31 @@ stdin). Write the text with a file tool or quoted heredoc first. Never embed
 Markdown backticks or `$()` inside a double-quoted shell prompt: the shell
 executes them before t3ctl receives the text. `answer --answers-file` accepts a
 JSON object keyed by the question IDs shown in userInputs.
+
+### Follow-up events (`"origin": "self"`)
+
+A thread that replied "waiting on the review" usually finishes the job in
+later turns nobody dispatched. With `monitoring: events` each of those turns
+reaches you as its own event, `"origin": "self"`, with `startKind`
+(`notification` = a subagent / delegated task / background command result,
+`pr-watch` = CI or review notice, `answer`, `scheduled`, …), `startSummary`
+and the turn's `lastAssistant`. Your dispatched turn's own event has
+`"origin": "dispatch"`.
+
+- Treat each as progress on the task you dispatched: when one says the PR
+  merged, the promo went out or the deploy is live, do the next step you
+  owe (verify, tell the user, the follow-up they asked for). Do not wait for
+  a second "done" that may never come.
+- Do not re-dispatch work a follow-up already reports, and do not start a
+  `watch` to catch these turns: they come to you.
+- `pr-watch` events are compact by default (`"compact": true`, reply cut
+  short): read the thread (`t3ctl last`) only if the summary matters.
+- Following stops silently when someone types in the thread (desktop/web/
+  phone; then the legacy callback path applies again), when another sender
+  or you dispatch to it again (your new dispatch is followed instead), or
+  after 6 h with nothing running. After
+  20 follow-ups you get one `"status": "monitoring-stopped", "reason":
+  "cap"` event: from then on check the thread yourself when you need to.
 
 State events describe one T3 turn, not completion of the entire user task.
 Review the changed artifacts/tests before claiming success. Terminal error,

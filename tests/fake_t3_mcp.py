@@ -29,6 +29,7 @@ from pathlib import Path
 import secrets
 import threading
 import time
+import urllib.parse
 import uuid
 from urllib.parse import parse_qs, urlencode
 
@@ -80,8 +81,20 @@ def _status(t):
 def _items(t):
     items = []
     for m in t["messages"]:
-        items.append({"type": "user_message" if m["role"] == "user" else "assistant_message",
+        if m.get("type") == "notification":
+            # T3 shows an agent-made turn start (subagent / delegated-task result,
+            # PR watch, background command) as a notification: no messageId,
+            # the message id is in the item id, the text is its summary.
+            items.append({"type": "notification", "messageId": None, "runId": m.get("runId"), "text": m["text"],
+                          "createdBy": None, "creationSource": None, "updatedAt": m.get("createdAt"),
+                          "itemId": "turn-item:message:" + urllib.parse.quote(m["id"], safe="")})
+            continue
+        user = m["role"] == "user"
+        mcp = user and str(m.get("id", "")).startswith("message:mcp:")
+        items.append({"type": "user_message" if user else "assistant_message",
                       "messageId": m.get("id"), "runId": m.get("runId"), "text": m["text"],
+                      "createdBy": m.get("createdBy", "agent" if mcp or not user else "user"),
+                      "creationSource": m.get("creationSource", "mcp" if mcp else "web" if user else "provider"),
                       "updatedAt": m.get("createdAt"), "itemId": f"item:{m.get('id')}"})
     for r in t["requests"]:
         if r["kind"] == "user_input":
@@ -111,7 +124,8 @@ def list_item(t):
             "runtimeMode": t["runtimeMode"], "interactionMode": t["interactionMode"],
             "settled": t["settledOverride"] == "settled", "settledAt": None,
             "snoozed": bool(t.get("snoozedUntil")), "snoozedUntil": t.get("snoozedUntil"),
-            "parentThreadId": None, "relationshipToParent": None, "itemCount": len(_items(t)),
+            "parentThreadId": t.get("parentThreadId"), "relationshipToParent": t.get("relationshipToParent"),
+            "itemCount": len(_items(t)),
             "createdAt": t["updatedAt"], "updatedAt": t["updatedAt"]}
 
 
@@ -202,8 +216,9 @@ def _call(state, name, args, access, namespace):
                 i["text"], i["textTruncated"], i["nextTextOffset"] = text[:cap], True, base + cap
         runs = [{"runId": r["id"], "ordinal": n + 1, "status": r["status"],
                  "startedAt": None if r.get("neverStarted") else "2026-09-08T10:00:00.000Z"} for n, r in enumerate(t["runs"])]
+        runs = runs[-args.get("runLimit", 5):]
         more = not args.get("itemId") and len(items) > len(pages)
-        return {"thread": detail(t), "recentRuns": runs[-args.get("runLimit", 5):],
+        return {"thread": detail(t), "recentRuns": runs,
                 "items": pages, "nextPosition": pages[-1]["position"] if pages else None, "hasMore": more}
 
     if name == "t3_thread_search":

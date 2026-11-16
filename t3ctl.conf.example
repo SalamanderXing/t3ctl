@@ -73,3 +73,13 @@ T3CTL_ALERT_FALLBACK=
 #T3CTL_EVENTS_DB=$T3CODE_HOME/t3ctl-events.sqlite
 #T3CTL_EVENTS_LOG=$T3CODE_HOME/t3ctl-events.log     # default: next to the events DB
 #T3CTL_EVENTS_LOG_MAX=1000000                       # bytes; one rotation (.log.1)
+# Follow-up turns: after a dispatched turn ends, the relay keeps reporting the
+# turns the thread starts by itself (subagent/delegated results, PR watch,
+# background commands). Read from the GATEWAY's environment (t3-events runs
+# inside Hermes); FOLLOW is also read by `t3-events managed` (t3-notify).
+#T3CTL_EVENTS_FOLLOW=1                     # 0: one event per dispatched turn only (pre-follow behaviour)
+#T3CTL_EVENTS_FOLLOW_IDLE_HOURS=6          # stop after this long with no running turn and no active child thread
+#T3CTL_EVENTS_FOLLOW_CAP=20                # follow-up events per dispatch; then one monitoring-stopped event
+#T3CTL_EVENTS_FOLLOW_PR_WATCH=compact      # compact | full | skip, for PR-watch (CI/review notice) turns
+#T3CTL_EVENTS_FOLLOW_COMPACT_CHARS=600     # reply length kept in a compact PR-watch event
+#T3CTL_EVENTS_FOLLOW_INTERVAL=30           # seconds between reads of a followed thread
