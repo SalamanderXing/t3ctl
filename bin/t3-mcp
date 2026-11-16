@@ -18,6 +18,11 @@ printed (latestTurn, session, hasPendingApprovals, …).
   t3-mcp messages ID [--runs N] [--cap C] [--with-error]
                                              thread + recent runs + their messages, full text
   t3-mcp run-of-message ID MESSAGE_ID        {"runId": …} the run a dispatched message started
+  t3-mcp run-origins ID (--after RUN | --after-message MSG) [--cap C] [--children] [--classify]
+                                             the runs after RUN (or after the run MSG started):
+                                             what started each (its user message or notification),
+                                             and, for runs that ended, their final reply/error;
+                                             --children counts active child threads (t3-events follow)
   t3-mcp search QUERY [--limit N]            t3_thread_search + each match's updatedAt
   t3-mcp scopes ACCESS                       the scopes an MCP sign-in at ACCESS carries
   t3-mcp required-tools                      the tools t3ctl calls (comma-separated)
@@ -393,6 +398,115 @@ def run_of_message(mcp, tid, message_id):
     return {"runId": runs.pop() if runs else None}
 
 
+NOTIFICATION_PREFIX = "turn-item:message:"
+
+
+def start_of(item):
+    """What started a run, from its first user_message / notification item.
+
+    Agent-originated turns (subagent and delegated-task results, PR-watch and
+    background-command notices, restart continuations) are `notification`
+    items with no messageId; their item id carries the starting message id.
+    Classification (human, dispatch, self, …) is t3-events' job.
+    """
+    if item is None:
+        return {"startType": None, "startMessageId": None, "createdBy": None, "creationSource": None, "startSummary": None}
+    mid = item.get("messageId")
+    if mid is None and (item.get("itemId") or "").startswith(NOTIFICATION_PREFIX):
+        mid = urllib.parse.unquote(item["itemId"][len(NOTIFICATION_PREFIX):])
+    return {"startType": item.get("type"), "startMessageId": mid, "createdBy": item.get("createdBy"),
+            "creationSource": item.get("creationSource"), "startSummary": (item.get("text") or "")[:300] or None}
+
+
+def never_started(run):
+    """A queued run cancelled before it began. T3 does this when it folds the
+    queued message into the run already in progress (a person typing while a
+    turn runs): the message then carries that run's id, not its own."""
+    return run.get("status") == "cancelled" and run.get("startedAt") is None
+
+
+def run_origins(mcp, tid, after=None, after_message=None, cap=0, children=False, classify=False):
+    """The runs after `after` and what started each, for t3-events' follow mode.
+
+    Each run gets its start (start_of) and `messages`: the other user messages
+    T3 put into it after it began (a person's message folded into a running
+    turn). Ended runs also get their final reply and error. With
+    `after_message`, `afterRun` reports the run that message started the
+    same way.
+
+    Cheap while nothing ended: one t3_thread_read. The timeline is scanned
+    only when a run after `after` has ended, a request is pending, or
+    `classify` asks for every run's start regardless.
+    """
+    if after_message is not None:
+        after = run_of_message(mcp, tid, after_message)["runId"]
+        if after is None:
+            raise ToolFailure("run_not_found", "the message has not started a run")
+    d = detail(mcp, tid, 50)
+    thread = add_pending(mcp, thread_from_detail(d["thread"]))
+    runs = sorted(d.get("recentRuns", []), key=lambda r: r["ordinal"])
+    ids = [r["runId"] for r in runs]
+    # An `after` no longer among the recent runs reports nothing (afterFound false), never old runs as new.
+    later = runs if after in (None, "none") else runs[ids.index(after) + 1:] if after in ids else []
+    out = {"afterRunId": after, "afterFound": after in (None, "none") or after in ids,
+           "latestTurn": thread["latestTurn"], "activeRunId": thread["activeRunId"],
+           "pendingRequestCount": thread["pendingRequestCount"],
+           "hasPendingApprovals": thread["hasPendingApprovals"], "hasPendingUserInput": thread["hasPendingUserInput"],
+           "classified": False,
+           "runs": [{"runId": r["runId"], "ordinal": r["ordinal"], "status": r.get("status"),
+                     "state": turn_state(r.get("status")), "startedAt": r.get("startedAt")} for r in later]}
+    if children:
+        count, cursor = 0, 0
+        for _ in range(10):   # 1000 active threads at most
+            page = mcp.call("t3_thread_list", {"allProjects": True, "includeSubagents": True,
+                                                "statuses": list(ACTIVE), "limit": PAGE, "cursor": cursor})
+            count += sum(1 for t in page.get("threads", []) if t.get("parentThreadId") == tid)
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                break
+        out["activeChildren"] = count
+    live = [r for r in out["runs"] if not never_started(r)]
+    with_after = after_message is not None and after in ids
+    if not (live or with_after) or not (classify or thread["pendingRequestCount"] or any(r["state"] != "running" for r in live)):
+        return out
+    wanted = {r["runId"] for r in live} | ({after} if with_after else set())
+    found = {}
+
+    def enough(items):
+        found.clear()
+        for i in items:
+            if i.get("runId") in wanted and i.get("type") in ("user_message", "notification"):
+                found.setdefault(i["runId"], i)
+        return wanted <= found.keys()
+
+    items = scan(mcp, tid, thread["itemCount"], "activity", enough, cap=300)
+
+    def describe(row):
+        start = found.get(row["runId"])
+        mine = [i for i in items if i.get("runId") == row["runId"]]
+        row.update(start_of(start))
+        row["messages"] = [start_of(i) for i in mine if i.get("type") == "user_message" and i is not start]
+        if row["state"] == "running":
+            return row
+        reply = next((i for i in reversed(mine) if i.get("type") == "assistant_message"), None)
+        error = next((i for i in reversed(mine) if i.get("type") == "error"), None)
+        text = complete_text(mcp, tid, reply, cap) if reply else None
+        if text is not None and cap > 0 and len(text) > cap:
+            text = text[:cap] + "…[truncated]"
+        row["lastAssistant"] = text
+        row["lastError"] = complete_text(mcp, tid, error, 2000) if error and row["state"] in ("error", "interrupted") else None
+        return row
+
+    for r in live:
+        describe(r)
+    if with_after:
+        a = runs[ids.index(after)]
+        out["afterRun"] = describe({"runId": after, "ordinal": a["ordinal"], "status": a.get("status"),
+                                    "state": turn_state(a.get("status")), "startedAt": a.get("startedAt")})
+    out["classified"] = True
+    return out
+
+
 def search(mcp, query, limit):
     """t3_thread_search, plus each match's updatedAt (search results carry none)."""
     matches = mcp.call("t3_thread_search", {"query": query, "limit": max(1, min(limit, 50))}).get("matches", [])
@@ -652,6 +766,14 @@ def main(argv):
             out = search(mcp, rest[0], int(f.get("limit", 20)))
         elif cmd == "run-of-message":
             out = run_of_message(mcp, argv[0], argv[1])
+        elif cmd == "run-origins":
+            f, rest = _flags(argv, {"--after": ("after", True), "--after-message": ("message", True),
+                                    "--cap": ("cap", True), "--children": ("children", False),
+                                    "--classify": ("classify", False)})
+            if not rest or ("after" in f) == ("message" in f):
+                return _usage("usage: t3-mcp run-origins ID (--after RUN | --after-message MSG) [--cap C] [--children] [--classify]")
+            out = run_origins(mcp, rest[0], f.get("after"), f.get("message"), int(f.get("cap", 0)),
+                              bool(f.get("children")), bool(f.get("classify")))
         else:
             return _usage(f"unknown command {cmd}")
         print(json.dumps(out, ensure_ascii=False))

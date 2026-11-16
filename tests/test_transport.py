@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from test_events import events
 
-from fake_t3_server import Handler, Server, State
+from fake_t3_server import Handler, Server, State, normalise
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = os.environ.get('T3CTL_TEST_BIN', str(ROOT / 'bin/t3ctl'))
@@ -260,6 +260,96 @@ class TransportTest(unittest.TestCase):
         out = self.cli('watch', 'test-thread', '--message-id', 'message', '--timeout', '0')
         self.assertEqual(out['lastAssistant'], 'OWNED OUTPUT')
         self.assertEqual(out['turnId'], 'owned')
+
+    def relay_poll(self, outbox):
+        with events.connect(outbox) as db:
+            db.execute('UPDATE subscriptions SET next_poll=0')
+        with patch.dict(os.environ, self.env, clear=True):
+            events.poll(outbox, CLI)
+        with events.connect(outbox) as db:
+            sub = dict(db.execute('SELECT * FROM subscriptions').fetchone())
+        return sub, [json.loads(e['payload']) for e in events.pending(outbox)]
+
+    def test_relay_follows_turns_the_thread_starts_itself(self):
+        # End to end over MCP: dispatch → its turn acknowledges → a delegated
+        # task's result and a PR-watch notice start turns with no dispatch →
+        # each is delivered; a person's message ends it.
+        outbox = self.path / 'events.sqlite'
+        self.events_env()
+        receipt = self.cli('say', 'test-thread', 'Ship it once the review is clean')
+        ours = self.thread['runs'][-1]
+        ours['status'] = 'completed'
+        self.thread['messages'].append({'role': 'assistant', 'text': 'Got it; the review is still running.', 'runId': ours['id']})
+        sub, pending = self.relay_poll(outbox)
+        self.assertEqual(sub['last_status'], 'following')
+        self.assertEqual([(p['status'], p['origin']) for p in pending], [('completed', 'dispatch')])
+        delegated = 'message:thread:test-thread:ordinal:169:4dcf'
+        self.thread['runs'].append({'id': 'sol', 'status': 'running', 'userMessageId': delegated})
+        self.thread['messages'] += [
+            {'id': delegated, 'type': 'notification', 'role': 'user', 'runId': 'sol', 'text': 'Delegated task "Review r2" finished'},
+            {'role': 'assistant', 'text': 'Review clean. Merged to dev, promoted to main, deploy verified.', 'runId': 'sol'}]
+        sub, pending = self.relay_poll(outbox)
+        self.assertEqual(len(pending), 1)   # still running: nothing new
+        self.thread['runs'][-1]['status'] = 'completed'
+        self.thread['runs'].append({'id': 'ci', 'status': 'completed', 'userMessageId': 'message:pr-watch:1'})
+        self.thread['messages'] += [
+            {'id': 'message:pr-watch:1', 'type': 'notification', 'role': 'user', 'runId': 'ci', 'text': '#101: checks passed'},
+            {'role': 'assistant', 'text': 'Checks green. ' + 'z' * 2000, 'runId': 'ci'}]
+        sub, pending = self.relay_poll(outbox)
+        follow = [p for p in pending if p['origin'] == 'self']
+        self.assertEqual([(p['turnId'], p['startKind'], p['status']) for p in follow],
+                         [('sol', 'notification', 'completed'), ('ci', 'pr-watch', 'completed')])
+        self.assertEqual(follow[0]['startMessageId'], delegated)
+        self.assertEqual(follow[0]['startSummary'], 'Delegated task "Review r2" finished')
+        self.assertIn('deploy verified', follow[0]['lastAssistant'])
+        self.assertTrue(follow[1]['compact'])
+        self.assertEqual((sub['follow_turn'], sub['follow_events']), ('ci', 2))
+        self.thread['runs'].append({'id': 'desk', 'status': 'completed', 'userMessageId': 'desk-msg'})
+        self.thread['messages'] += [{'id': 'desk-msg', 'role': 'user', 'runId': 'desk', 'text': 'is it live?'},
+                                    {'role': 'assistant', 'text': 'Yes.', 'runId': 'desk'}]
+        sub, pending = self.relay_poll(outbox)
+        self.assertEqual((sub['last_status'], sub['follow_reason']), ('released', 'human'))
+        self.assertEqual(len(pending), 3)
+        self.assertEqual(receipt['messageId'], sub['message_id'])
+
+    def test_origins_reports_starts_replies_and_active_children(self):
+        self.thread['runs'] += [{'id': 'sub', 'status': 'completed', 'userMessageId': 'n1'},
+                                {'id': 'live', 'status': 'running', 'userMessageId': 'n2'}]
+        self.thread['messages'] += [
+            {'id': 'n1', 'type': 'notification', 'role': 'user', 'runId': 'sub', 'text': 'Command "deploy" finished'},
+            {'id': 'typed', 'role': 'user', 'text': 'also do X', 'runId': 'sub'},   # folded in by T3
+            {'role': 'assistant', 'text': 'Deployed.', 'runId': 'sub'},
+            {'id': 'n2', 'type': 'notification', 'role': 'user', 'runId': 'live', 'text': 'Delegated task finished'}]
+        self.thread['runs'].insert(2, {'id': 'folded', 'status': 'cancelled', 'userMessageId': 'typed', 'neverStarted': True})
+        self.server.state.threads['child'] = normalise({
+            'id': 'child', 'title': '[test] child', 'projectId': 'project', 'runtimeMode': 'approval-required',
+            'parentThreadId': 'test-thread', 'runs': [{'id': 'c1', 'status': 'running', 'userMessageId': 'cm'}]})
+        out = self.cli('origins', 'test-thread', '--after-turn', 'old', '--children')
+        self.assertTrue(out['classified'])
+        self.assertEqual(out['activeChildren'], 1)
+        self.assertEqual(out['activeRunId'], 'live')
+        sub, folded, live = out['runs']
+        self.assertEqual((sub['startType'], sub['startMessageId'], sub['startSummary'], sub['state'], sub['lastAssistant']),
+                         ('notification', 'n1', 'Command "deploy" finished', 'completed', 'Deployed.'))
+        self.assertEqual([(m['startMessageId'], m['createdBy'], m['creationSource']) for m in sub['messages']],
+                         [('typed', 'user', 'web')])
+        self.assertEqual((folded['status'], folded['startedAt']), ('cancelled', None))
+        self.assertNotIn('startType', folded)   # never started: not looked for in the timeline
+        self.assertEqual(events.stop_kind(sub), 'human')
+        self.assertEqual((live['state'], live['startMessageId']), ('running', 'n2'))
+        self.assertNotIn('lastAssistant', live)
+        # nothing ended and nothing asked: one read, no timeline scan
+        self.thread['messages'].insert(0, {'id': 'old-message', 'role': 'user', 'text': 'first', 'runId': 'old'})
+        self.thread['messages'].insert(1, {'role': 'assistant', 'text': 'First reply.', 'runId': 'old'})
+        mine = self.cli('origins', 'test-thread', '--message-id', 'old-message', '--classify')
+        self.assertEqual((mine['afterRun']['runId'], mine['afterRun']['state'], mine['afterRun']['lastAssistant']),
+                         ('old', 'completed', 'First reply.'))
+        quiet = self.cli('origins', 'test-thread', '--after-turn', 'folded')
+        self.assertFalse(quiet['classified'])
+        self.assertNotIn('startType', quiet['runs'][0])
+        self.assertTrue(self.cli('origins', 'test-thread', '--after-turn', 'sub', '--classify')['classified'])
+        self.assertEqual(self.cli('origins', 'test-thread', '--after-turn', 'live')['runs'], [])
+        self.assertEqual(self.cli('origins', 'test-thread', success=False).returncode, 1)
 
     def test_manual_or_desktop_takeover_restores_legacy_callback(self):
         self.events_env()

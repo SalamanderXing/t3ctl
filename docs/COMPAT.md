@@ -26,6 +26,17 @@ for re-extracting the internal contracts after a break is
 
 Behaviour changes callers may notice (not t3-version related):
 
+- unreleased (events follow mode): after a dispatched turn ends,
+  `t3-events` keeps following the thread and sends one event per turn the
+  thread starts by itself (`"origin": "self"`, `startKind`, `startMessageId`,
+  `startSummary`, `follow`); dispatched-turn events gain `"origin":
+  "dispatch"`. A dispatched turn overtaken by such a turn is followed, not
+  reported `superseded`; its own reply is still delivered. A person's
+  message T3 folds into a running turn (it cancels the queued run) ends the
+  follow. `t3-events managed` stays true for self-started turns.
+  New `t3ctl origins` (MCP `t3_thread_read` activity view + `t3_thread_list`
+  with `includeSubagents`). `T3CTL_EVENTS_FOLLOW=0` restores the old
+  behaviour. The events DB gains four nullable columns, added in place.
 - v0.6.1: a `say --dispatch-id` replayed after its run became visible
   reports the turn the message was first sent after as `previousTurnId`
   (recorded in the dispatch ledger at reservation), not its own run. v0.6.0
@@ -131,6 +142,7 @@ MCP cannot do it:
 | RPC `projects.mutate` | `project add`, `project set-model` | `t3_project_create/update` need a full-access ceiling |
 | RPC `orchestration.searchThreads` | `contract-check` only | probes the `/ws` leg and auth |
 | SQLite `orchestration_v2_projection_runs` | `t3-events managed`/`turn` | runs inside the coding session (t3-notify, as the t3 user), which holds no t3ctl credential |
+| SQLite `orchestration_v2_projection_messages` (`createdBy`, `creationSource`, `notification`) | `t3-events managed` during a follow | same; who started each run after the dispatched one |
 
 Fields derived rather than read: `lastError` is the latest run's `error`
 item; pending approvals vs questions are `pendingRequestCount` minus
@@ -157,6 +169,15 @@ likely to:
    snapshot's `runs`/`runtimeRequests`/`turnItems`/`messages`.
 5. `t3-events`' SQL on `orchestration_v2_projection_runs`
    (`json_extract(payload_json, '$.userMessageId')`).
+6. Who started a run, which follow mode depends on: the MCP activity view
+   shows a person's or a sender's turn start as a `user_message` item with
+   `createdBy`/`creationSource`, and an agent-made one (subagent and
+   delegated-task results, PR watch, background command) as a
+   `notification` item whose `itemId` is `turn-item:message:` + the
+   URL-encoded message id; PR-watch message ids start `message:pr-watch:`,
+   answers `async-answer:`. If T3 changes this, unrecognised starts are
+   followed (`startKind: unknown`), never silently dropped; `managed` then
+   answers false (a duplicate legacy callback, not a missing one).
 
 ## Known limits (v0.6.0)
 

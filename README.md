@@ -8,7 +8,7 @@ versioned thing.
 
 ```
 bin/t3ctl                 the CLI (JSON/JSONL out): projects, models, list, new, say, last,
-                          show, search, watch, answer, approvals, approve, approve-callbacks,
+                          show, search, watch, origins, answer, approvals, approve, approve-callbacks,
                           settle/unsettle, interrupt/stop/rm, selftest, contract-check
                           (`list` with no flag is the app's inbox — unsettled,
                           unarchived; `--unarchived` is every non-archived
@@ -25,7 +25,8 @@ bin/t3-notify             a session's callback to the agent: signed POST to the 
                           webhook platform (route t3-callback)
 bin/t3-rpc                one Effect-RPC call over t3's /ws WebSocket (stdlib Python);
                           the legacy path's commands go through it
-bin/t3-events             session state events for the Hermes gateway (opt-in)
+bin/t3-events             session state events for the Hermes gateway (opt-in), including
+                          the turns a thread starts by itself after a dispatch
 units/                    t3-token-renew.timer (weekly), t3-callback-approver.service
 skills/devops/t3/         the agent-facing Hermes skill
 install.sh                idempotent installer (run as root on the box)
@@ -194,6 +195,65 @@ Delivery failures back off, stop after eight attempts, and remain visible via
 retained seven days. Registrations fail independently of the primary dispatch:
 inspect `monitoring: manual` and use the receipt's messageId with `watch --message-id`.
 
+### Follow-up turns (the thread keeps working after the dispatch)
+
+A dispatched turn often ends with "still waiting on the review"; the work
+then continues in turns nobody dispatched: a subagent or delegated-task
+result, a PR-watch notice (CI, reviews, merges), a background command
+finishing. Each starts a new turn. So after the dispatched turn ends
+(completed, error or interrupted) the subscription keeps **following** the
+thread, and every later turn that the thread started by itself produces one
+event for its terminal state (or its pending question/approval), delivered to
+the same session as the dispatch. Its payload says `"origin": "self"` (the
+dispatched turn's says `"origin": "dispatch"`), plus `startKind`,
+`startMessageId` and `startSummary` (who started the turn: `notification` for
+subagent, delegated-task and background-command results, `pr-watch`, `answer`,
+`scheduled`, `restart`, `agent`, `unknown`) and `follow.count`/`follow.cap`.
+Turns that ended between two polls are each reported, in order.
+
+Following stops, without an event, when:
+
+- a person's message (desktop, web, mobile) starts a turn, or is folded into
+  a running one (T3 moves a message typed during a turn into that turn and
+  cancels the run it had queued): they took over, and that turn's reply,
+  written for them, is not sent;
+- another sender's MCP message starts a turn (an unregistered dispatch);
+- a new dispatch registers on the thread (it supersedes the old dispatch's
+  undelivered events, as before);
+- the thread has had no running turn and no active child thread (delegated
+  task/subagent) for `T3CTL_EVENTS_FOLLOW_IDLE_HOURS` (default 6).
+
+and, after `T3CTL_EVENTS_FOLLOW_CAP` follow-up events (default 20; `0` = no
+cap), with one final `"status": "monitoring-stopped", "reason": "cap"` event.
+A replay of the same dispatch (`--dispatch-id`) does not restart a follow in
+progress or one that ended.
+
+PR-watch turns (`T3CTL_EVENTS_FOLLOW_PR_WATCH`): `compact` (default) delivers
+them with the reply cut to `T3CTL_EVENTS_FOLLOW_COMPACT_CHARS` (600) and
+`"compact": true`; `full` delivers them like any other turn; `skip` sends
+nothing for them (they still count as activity, not against the cap). They
+are not skipped by default because that is where releases happen: in the
+2026-11-16 incident the PR-watch turns merged the PR and opened and merged
+the promotion, and a skipped "CI-only" turn cannot be told apart from those
+without reading it.
+
+While following, the relay reads the thread every `T3CTL_EVENTS_FOLLOW_INTERVAL`
+seconds (30) with `t3ctl origins` (one `t3_thread_read`; the timeline is read
+only once a turn has ended or asks for something). `T3CTL_EVENTS_FOLLOW=0`
+turns follow mode off (one event per dispatched turn, as before);
+`t3-events managed` honours it too. Legacy `t3-notify` callbacks stay
+suppressed while the thread's current turn is the dispatched one or one it
+started itself during a follow (except a PR-watch turn in `skip` mode), and
+resume after a person or another sender takes over or the follow stops. If
+the dispatched turn is overtaken by a self-started turn before the relay sees
+it end (queued PR-watch notices start the moment a turn ends), the relay still
+reports the dispatched turn's own end, reply included, and follows from it,
+instead of reporting `superseded`; a person typing into the dispatched turn is
+still `superseded`. A new dispatch supersedes the previous dispatch's
+undelivered follow-up events, as it does its other undelivered events: the
+new dispatch was decided without them, and `t3ctl last` shows the thread's
+current state.
+
 The outbox survives restarts. Acknowledgement is after gateway adapter
 acceptance, not after the resulting model turn finishes. A crash between
 acceptance and acknowledgement can replay an event (at-least-once delivery);
@@ -209,8 +269,8 @@ responses cannot overflow the OS argument limit.
 Run `bash tests/smoke.sh` (it ends with the v0.5.0 output-shape comparison and
 the unit tests, `python3 -m unittest discover -s tests -p 'test_*.py'`).
 
-State-read failures back off and stop after eight consecutive failures, emitting
-`monitoring-failed` for the owner to inspect. `t3-events status` exposes retained
+State-read failures (dispatched turn or follow) back off and stop after eight
+consecutive failures, emitting `monitoring-failed` for the owner to inspect. `t3-events status` exposes retained
 event outcomes and subscription states. A new dispatch resets monitoring.
 
 Turn ownership is resolved from the dispatched message: T3 records the run
