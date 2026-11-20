@@ -81,6 +81,17 @@ class EventsTest(RelayCase):
         asyncio.run(events.deliver_pending(self.runner, self.db))
         self.assertEqual(self.runner._dispatch_plugin_message_injection.call_args.kwargs['expected_session_id'], 'compressed-parent')
 
+    def test_compression_tip_through_the_storage_interface(self):
+        # hermes-agent v0.23.3+: the runner's storage interface handle answers the tip; _session_db has none.
+        self.observe()
+        self.runner.persistence = SimpleNamespace(aio=SimpleNamespace(lineage=SimpleNamespace(
+            tip=AsyncMock(return_value='compressed-parent'))))
+        self.runner._session_db = SimpleNamespace()
+        self.runner.async_session_store.lookup_by_session_key.return_value.session_id = 'compressed-parent'
+        asyncio.run(events.deliver_pending(self.runner, self.db))
+        self.runner.persistence.aio.lineage.tip.assert_awaited_once_with('parent')
+        self.assertEqual(self.runner._dispatch_plugin_message_injection.call_args.kwargs['expected_session_id'], 'compressed-parent')
+
     def test_retries_are_bounded_and_retained(self):
         self.observe()
         self.runner._dispatch_plugin_message_injection.return_value = False

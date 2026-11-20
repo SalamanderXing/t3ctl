@@ -644,6 +644,15 @@ def retry(event_id, path=None):
             logger.error('T3 event %s exhausted delivery retries; retained for inspection', event_id)
 
 
+async def _compression_tip(runner, session_id):
+    """The live end of the session's compression chain. hermes-agent v0.23.3+ reads it through the storage
+    interface (``runner.persistence``); older gateways serve it from ``runner._session_db``."""
+    store = getattr(runner, 'persistence', None)
+    if store is not None:
+        return await store.aio.lineage.tip(session_id)
+    return await runner._session_db.get_compression_tip(session_id)
+
+
 async def deliver_pending(runner, path=None):
     for event in await asyncio.to_thread(pending, path):
         try:
@@ -663,7 +672,7 @@ async def deliver_pending(runner, path=None):
             if entry is None:
                 await asyncio.to_thread(retry, event['id'], path)
                 continue
-            tip = await runner._session_db.get_compression_tip(event['parent_session_id'])
+            tip = await _compression_tip(runner, event['parent_session_id'])
             if entry.session_id not in (event['parent_session_id'], tip):
                 await asyncio.to_thread(finish, event['id'], 'dropped', path)
                 continue
