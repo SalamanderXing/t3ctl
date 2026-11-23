@@ -263,6 +263,10 @@ def thread_from_list(t):
         "archived": False, "itemCount": t.get("itemCount", 0),
         "parentThreadId": t.get("parentThreadId"),
         "createdAt": t.get("createdAt"), "updatedAt": t.get("updatedAt"), "link": t.get("link"),
+        # What a `waiting` run waits on (the running cap leaves out a turn parked on a PR watch alone).
+        "watchingPullRequest": any(bool((pr or {}).get("watching")) for pr in t.get("pullRequests") or []),
+        "pendingBackgroundTasks": len(t.get("pendingBackgroundTasks") or []),
+        "blockedOnThreadWait": bool(t.get("blockedOnThreadWait")),
     }
 
 

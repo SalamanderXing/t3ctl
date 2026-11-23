@@ -124,7 +124,9 @@ ceiling `T3CTL_MCP_ACCESS` — `auto` while `T3CTL_ALLOW_FULL_ACCESS=0`.
   otherwise; a full-access default needs `T3CTL_ALLOW_FULL_ACCESS=1` and
   falls back to approval-required with a warning otherwise) with a title
   tag; `--full-access` must be spelled out;
-  `new` refuses at `T3CTL_MAX_RUNNING` running tagged turns; `stop`/
+  `new` refuses at `T3CTL_MAX_RUNNING` running tagged turns (a turn `waiting` only on a
+  watched PR, with no background task and no thread wait, holds no slot; `t3ctl slots` prints
+  the same count as `{running, limit, free, parkedOnPullRequestWatch}`); `stop`/
   `interrupt`/`rm` refuse untagged threads without `--force`; `say` inherits
   the target thread's mode.
 - **Tokens always expire** (30 d), hence the weekly rotation of both, each
