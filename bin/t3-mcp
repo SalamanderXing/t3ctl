@@ -264,10 +264,22 @@ def thread_from_list(t):
         "parentThreadId": t.get("parentThreadId"),
         "createdAt": t.get("createdAt"), "updatedAt": t.get("updatedAt"), "link": t.get("link"),
         # What a `waiting` run waits on (the running cap leaves out a turn parked on a PR watch alone).
-        "watchingPullRequest": any(bool((pr or {}).get("watching")) for pr in t.get("pullRequests") or []),
-        "pendingBackgroundTasks": len(t.get("pendingBackgroundTasks") or []),
+        # T3 lists a PR watch itself as a pending background task (kind `monitor`, taskId
+        # `pull-request-watch:…`), so it is counted as the watch, not as other background work.
+        "watchingPullRequest": (any(bool((pr or {}).get("watching")) for pr in t.get("pullRequests") or [])
+                                or any(is_pr_watch(task) for task in t.get("pendingBackgroundTasks") or [])),
+        "pendingBackgroundTasks": sum(1 for task in t.get("pendingBackgroundTasks") or [] if not is_pr_watch(task)),
         "blockedOnThreadWait": bool(t.get("blockedOnThreadWait")),
     }
+
+
+PR_WATCH_TASK = "pull-request-watch:"   # T3's own prefix for a PR watch's background task
+
+
+def is_pr_watch(task):
+    """A pending background task that is T3 watching a pull request ({taskId, kind, awaited} in 0.1.11)."""
+    task_id = (task.get("taskId") or task.get("id") or "") if isinstance(task, dict) else str(task or "")
+    return str(task_id).startswith(PR_WATCH_TASK)
 
 
 def detail(mcp, tid, runs=1):

@@ -74,11 +74,14 @@ cat > "$TMP/seed.json" <<EOF
   {"id":"$SEED_PR_WATCH","title":"[kosmi] parked on PR #12","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
    "settledOverride":"settled","updatedAt":"2026-09-08T06:00:00.000Z",
    "pullRequests":[{"number":12,"state":"open","watching":true}],
+   "pendingBackgroundTasks":[{"taskId":"pull-request-watch:github.com/ai-kosmo/aikosmo-monorepo#12","kind":"monitor","awaited":false}],
    "runs":[{"id":"t-5","status":"waiting","userMessageId":"m-6"}],
    "messages":[{"id":"m-6","role":"user","createdAt":"2026-09-08T06:00:00.000Z","text":"ship it","runId":"t-5"}]},
   {"id":"$SEED_BG_WAIT","title":"[kosmi] waits on tests","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
    "settledOverride":"settled","updatedAt":"2026-09-08T05:00:00.000Z",
-   "pullRequests":[{"number":13,"state":"open","watching":true}], "pendingBackgroundTasks":[{"id":"bg-1"}],
+   "pullRequests":[{"number":13,"state":"open","watching":true}],
+   "pendingBackgroundTasks":[{"taskId":"pull-request-watch:github.com/ai-kosmo/aikosmo-monorepo#13","kind":"monitor","awaited":false},
+                             {"taskId":"command:bun-test-7f3a","kind":"command","awaited":true}],
    "runs":[{"id":"t-6","status":"waiting","userMessageId":"m-7"}],
    "messages":[{"id":"m-7","role":"user","createdAt":"2026-09-08T05:00:00.000Z","text":"run the suite","runId":"t-6"}]}
  ]}
