@@ -35,7 +35,8 @@
 #     deployment says otherwise), say inherits the thread's mode, and
 #     --full-access / a full-access default only exist when
 #     T3CTL_ALLOW_FULL_ACCESS=1 (default).
-#   - new refuses while >= T3CTL_MAX_RUNNING tagged turns are already running.
+#   - new refuses while >= T3CTL_MAX_RUNNING tagged turns are already running (a turn waiting
+#     only on a PR watch does not count; `t3ctl slots` prints the same count).
 #   - stop/interrupt/rm refuse threads not titled "$T3CTL_TAG …" without
 #     --force (those are the owner's own sessions, not ours to kill).
 #   - T3CTL_DENY_ORIGINS refuses every command from listed Hermes session
@@ -108,6 +109,9 @@ t3ctl — drive T3 Code sessions (JSON/JSONL output)
                                           non-archived thread, settled too;
                                           --active only running/attention;
                                           --all everything, archived included
+  t3ctl slots                             the running cap's count as `new` checks it:
+                                          {running, limit, free, parkedOnPullRequestWatch}
+                                          (a turn waiting only on a PR watch holds no slot)
   t3ctl new <project> "<prompt>" [opts]   create thread + start first turn
         [--title T] [--plan | --execute] [--prompt-file path|-] [--model M] [--mode M | --full-access]
         [--dispatch-id ID]
@@ -638,6 +642,27 @@ send_message() { # $1 thread id, $2 text, $3 dispatch id → MCP send receipt
     | mcp call t3_thread_send - --retry
 }
 
+# The running cap's count, shared by `new` and `slots`: $TAG threads whose run is active
+# ($ACTIVE_STATUSES), except a turn that is `waiting` on nothing but a watched PR (no pending
+# background task, not blocked on a thread wait). Such a turn can sit parked until the PR closes;
+# counting it let one PR watch hold a coding slot for days. It counts again once it runs.
+slot_counts() {
+  local rows
+  rows=$(mcp threads --all-projects --statuses "$ACTIVE_STATUSES" --title-contains "$TAG") || return 1
+  jq -c --arg tag "$TAG" --argjson limit "$MAX_RUNNING" '
+    [.[] | select(.title | startswith($tag))] as $ours
+    | ($ours | map(select(.session.status == "waiting" and (.watchingPullRequest == true)
+                          and ((.pendingBackgroundTasks // 0) == 0) and (.blockedOnThreadWait != true)))) as $parked
+    | (($ours | length) - ($parked | length)) as $running
+    | {running: $running, limit: $limit, free: ([$limit - $running, 0] | max),
+       parkedOnPullRequestWatch: ($parked | length)}' <<<"$rows"
+}
+
+cmd_slots() {
+  [ $# -eq 0 ] || die "slots takes no arguments"
+  slot_counts || exit 1
+}
+
 cmd_new() {
   local project="" prompt="" prompt_file="" title="" mode=$DEFAULT_MODE imode=default explicit="" model="" dispatch_id=""
   [ "$mode" = full-access ] && explicit=explicit   # deployment default, already gated above
@@ -671,8 +696,8 @@ cmd_new() {
   # An accepted replay of a dispatch that already passed the cap returns that same work.
   if [ -z "$REPLAY" ]; then
     local running
-    running=$(mcp threads --all-projects --statuses "$ACTIVE_STATUSES" --title-contains "$TAG") || exit 1
-    running=$(jq --arg tag "$TAG" '[.[] | select(.title | startswith($tag))] | length' <<<"$running")
+    running=$(slot_counts) || exit 1
+    running=$(jq '.running' <<<"$running")
     [ "$running" -ge "$MAX_RUNNING" ] && \
       die "$running $TAG turns already running (limit $MAX_RUNNING) — finish or interrupt one first, or raise T3CTL_MAX_RUNNING"
   fi
@@ -1190,6 +1215,7 @@ case ${1:---help} in
   models)     shift; cmd_models "$@";;
   list)       shift; cmd_list "$@";;
   new)        shift; cmd_new "$@";;
+  slots)      shift; cmd_slots "$@";;
   say)        shift; cmd_say "$@";;
   show)       shift; cmd_show "$@";;
   last)       shift; cmd_last "$@";;

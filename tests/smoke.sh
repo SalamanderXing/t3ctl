@@ -38,6 +38,8 @@ SEED_OURS=22222222-2222-4222-8222-222222222222
 SEED_OTHER=33333333-3333-4333-8333-333333333333
 SEED_SETTLED=44444444-4444-4444-8444-444444444444    # on the app's settled shelf
 SEED_ARCHIVED=55555555-5555-4555-8555-555555555555   # archived (only --all shows it)
+SEED_PR_WATCH=66666666-6666-4666-8666-666666666666   # [kosmi] turn waiting only on a PR watch
+SEED_BG_WAIT=77777777-7777-4777-8777-777777777777    # [kosmi] turn waiting on a background task
 LONG=$(printf 'x%.0s' $(seq 1 3500))   # an assistant reply longer than the 3000-char terminal cap
 cat > "$TMP/seed.json" <<EOF
 {"projects":[{"id":"$PID_PROJECT","title":"aikosmo-monorepo","workspaceRoot":"/data/repo","defaultModelSelection":null}],
@@ -68,7 +70,20 @@ cat > "$TMP/seed.json" <<EOF
   {"id":"$SEED_ARCHIVED","title":"Archived thread","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
    "archivedAt":"2026-09-08T07:30:00.000Z","updatedAt":"2026-09-08T07:00:00.000Z",
    "runs":[{"id":"t-4","status":"completed","userMessageId":"m-5"}],
-   "messages":[{"id":"m-5","role":"user","createdAt":"2026-09-08T07:00:00.000Z","text":"archived prompt","runId":"t-4"}]}
+   "messages":[{"id":"m-5","role":"user","createdAt":"2026-09-08T07:00:00.000Z","text":"archived prompt","runId":"t-4"}]},
+  {"id":"$SEED_PR_WATCH","title":"[kosmi] parked on PR #12","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
+   "settledOverride":"settled","updatedAt":"2026-09-08T06:00:00.000Z",
+   "pullRequests":[{"number":12,"state":"open","watching":true}],
+   "pendingBackgroundTasks":[{"taskId":"pull-request-watch:github.com/ai-kosmo/aikosmo-monorepo#12","kind":"monitor","awaited":false}],
+   "runs":[{"id":"t-5","status":"waiting","userMessageId":"m-6"}],
+   "messages":[{"id":"m-6","role":"user","createdAt":"2026-09-08T06:00:00.000Z","text":"ship it","runId":"t-5"}]},
+  {"id":"$SEED_BG_WAIT","title":"[kosmi] waits on tests","projectId":"$PID_PROJECT","runtimeMode":"approval-required",
+   "settledOverride":"settled","updatedAt":"2026-09-08T05:00:00.000Z",
+   "pullRequests":[{"number":13,"state":"open","watching":true}],
+   "pendingBackgroundTasks":[{"taskId":"pull-request-watch:github.com/ai-kosmo/aikosmo-monorepo#13","kind":"monitor","awaited":false},
+                             {"taskId":"command:bun-test-7f3a","kind":"command","awaited":true}],
+   "runs":[{"id":"t-6","status":"waiting","userMessageId":"m-7"}],
+   "messages":[{"id":"m-7","role":"user","createdAt":"2026-09-08T05:00:00.000Z","text":"run the suite","runId":"t-6"}]}
  ]}
 EOF
 
@@ -315,6 +330,20 @@ if T3CTL_MAX_RUNNING=1 "$T3CTL" new aikosmo-monorepo "y" --model codex:gpt-5.6-s
 assert_contains "$(cat "$TMP/err")" "already running (limit 1)" "cap message"
 [ "$(mcp_sends)" -eq "$before" ] || fail "the running cap must refuse before launching"
 ok "new refuses beyond T3CTL_MAX_RUNNING, before any launch"
+out=$(T3CTL_TAG="[kosmi] parked" T3CTL_MAX_RUNNING=1 "$T3CTL" slots)
+assert_contains "$out" '"running":0' "a turn waiting only on a PR watch holds no slot"
+assert_contains "$out" '"parkedOnPullRequestWatch":1' "slots reports the parked turn"
+assert_contains "$out" '"free":1' "free = limit - running"
+out=$(T3CTL_TAG="[kosmi] waits on" T3CTL_MAX_RUNNING=1 "$T3CTL" slots)
+assert_contains "$out" '"running":1' "a turn waiting on a background task still holds its slot"
+out=$(T3CTL_MAX_RUNNING=99 "$T3CTL" slots)
+running=$(jq .running <<<"$out")
+before=$(mcp_sends)
+if T3CTL_MAX_RUNNING=$running "$T3CTL" new aikosmo-monorepo "z" --model codex:gpt-5.6-sol 2>"$TMP/err"; then fail "slots and new disagree on the count"; fi
+assert_contains "$(cat "$TMP/err")" "$running .kosmi. turns already running (limit $running)" "new refuses on exactly the slots count"
+[ "$(mcp_sends)" -eq "$before" ] || fail "the running cap must refuse before launching"
+if "$T3CTL" slots extra 2>/dev/null; then fail "slots takes no arguments"; fi
+ok "slots: the cap's count; a PR-watch-only wait holds no slot, a background wait does"
 
 # ---- 5. ownership guard -----------------------------------------------------
 n_before=$(jq length "$STATE")

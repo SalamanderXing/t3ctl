@@ -126,6 +126,9 @@ def list_item(t):
             "snoozed": bool(t.get("snoozedUntil")), "snoozedUntil": t.get("snoozedUntil"),
             "parentThreadId": t.get("parentThreadId"), "relationshipToParent": t.get("relationshipToParent"),
             "itemCount": len(_items(t)),
+            # What a waiting run waits on, as T3 0.1.11 lists it.
+            "pullRequests": t.get("pullRequests", []), "blockedOnThreadWait": t.get("blockedOnThreadWait", False),
+            "pendingBackgroundTasks": t.get("pendingBackgroundTasks", []),
             "createdAt": t["updatedAt"], "updatedAt": t["updatedAt"]}
 
 
